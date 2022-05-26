@@ -175,7 +175,7 @@ $ rm -rf build && make install LOADER_DEBUG=1
 this will print extra messages in the Vertica log files (either ``UDxLogs/UDxFencedProcesses.log`` or ``vertica.log`` depending if the library was "FENCED" or "UNFENCED"). **Caution:** don't do this in production because it will flood your logs with debug messages and slowdown everything.
 
 ### PCRE Missing symbols
-The following error during the deloyment phase has been reported on a few Linux Distributions:
+The following error has been reported, during the deloyment phase, on a few Linux Distributions:
 ```
 undefined symbol: _ZNK7pcrecpp2RE13GlobalReplaceERKNS_11StringPieceEPSs
 ```
