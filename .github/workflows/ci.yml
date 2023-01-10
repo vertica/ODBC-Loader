@@ -17,6 +17,7 @@ jobs:
       timeout-minutes: 15
       run: |
         docker run -d -p 5433:5433 -p 5444:5444 \
+          -v $GITHUB_WORKSPACE:/home/dbadmin/odbc-loader\
           --name vertica_docker \
           vertica/vertica-ce:12.0.2-0
         echo "Vertica startup ..."
@@ -29,5 +30,5 @@ jobs:
         docker exec -u dbadmin vertica_docker /opt/vertica/bin/vsql -c "select version()"
     - name: Build & Install UDx
       run: |
-        docker exec -u dbadmin vertica_docker make -C /github/workspace/
-        docker exec -u dbadmin vertica_docker make -C /github/workspace/ install
+        docker exec -u dbadmin vertica_docker make -C /home/dbadmin/odbc-loader
+        docker exec -u dbadmin vertica_docker make -C /home/dbadmin/odbc-loader install
