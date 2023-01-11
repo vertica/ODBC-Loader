@@ -4,11 +4,12 @@ SDK_HOME ?= /opt/vertica/sdk
 SHELL = /bin/bash
 VSQL ?= /opt/vertica/bin/vsql
 LOADER_DEBUG = 0
+TARGET ?= build
 
 ALL_CXXFLAGS := $(CXXFLAGS) -I $(SDK_HOME)/include -I $(SDK_HOME)/examples/HelperLibraries -fPIC -shared -Wall -g -std=c++11 -lpcrecpp -lpcre -D_GLIBCXX_USE_CXX11_ABI=0
 ALL_CXXFLAGS += -DLOADER_DEBUG=$(LOADER_DEBUG)
 
-build: build/ODBCLoader.so
+build: $(TARGET)/ODBCLoader.so
 ## See targets below for actual build logic
 
 clean:
@@ -44,6 +45,6 @@ test_impl:
 
 
 ## Actual build target
-build/ODBCLoader.so: ODBCLoader.cpp $(SDK_HOME)/include/Vertica.cpp $(SDK_HOME)/include/BuildInfo.h
-	mkdir -p build
+$(TARGET)/ODBCLoader.so: ODBCLoader.cpp $(SDK_HOME)/include/Vertica.cpp $(SDK_HOME)/include/BuildInfo.h
+	mkdir -p $(TARGET)
 	$(CXX) $(ALL_CXXFLAGS) -o $@ $(SDK_HOME)/include/Vertica.cpp ODBCLoader.cpp -lodbc
