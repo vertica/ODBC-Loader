@@ -30,5 +30,6 @@ jobs:
         docker exec -u dbadmin vertica_docker /opt/vertica/bin/vsql -c "select version()"
     - name: Build & Install UDx
       run: |
+        docker exec -u dbadmin vertica_docker yum install devtoolset-7
         docker exec -u dbadmin vertica_docker make -C /home/dbadmin/odbc-loader TARGET=/home/dbadmin/build
         docker exec -u dbadmin vertica_docker make -C /home/dbadmin/odbc-loader install TARGET=/home/dbadmin/build
