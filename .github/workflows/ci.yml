@@ -13,11 +13,14 @@ jobs:
 
     steps:
     - uses: actions/checkout@v3
+    - name: show files
+      run: |
+        ls ${{ github.workspace }}
     - name: Set up a Vertica server
       timeout-minutes: 15
       run: |
         docker run -d -p 5433:5433 -p 5444:5444 \
-          -v ${{ github.workspace }}:/home/dbadmin/odbc-loader\
+          -v ${{ github.workspace }}:/home/dbadmin/odbc-loader \
           --name vertica_docker \
           vertica/vertica-ce:12.0.2-0
         echo "Vertica startup ..."
