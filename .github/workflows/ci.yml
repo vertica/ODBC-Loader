@@ -33,6 +33,8 @@ jobs:
       run: |
         docker exec -u root vertica_docker yum -y install centos-release-scl
         docker exec -u root vertica_docker yum -y install devtoolset-7
-        docker exec -w /var/odbc-loader -u dbadmin vertica_docker scl enable devtoolset-7 bash && \
-        make && \
-        make install
+        docker exec -u root vertica_docker yum -y install unixODBC-devel
+        docker exec -u root vertica_docker yum -y install pcre-devel
+        docker exec -w /var/odbc-loader -u dbadmin vertica_docker /bin/bash -c "source /opt/rh/devtoolset-7/enable; \
+        make; \
+        make install"
