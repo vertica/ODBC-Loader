@@ -4,7 +4,7 @@ SDK_HOME ?= /opt/vertica/sdk
 SHELL = /bin/bash
 VSQL ?= /opt/vertica/bin/vsql
 LOADER_DEBUG = 0
-TARGET ?= build
+TARGET ?= /opt/vertica/packages/odbc-loader/lib
 
 ALL_CXXFLAGS := $(CXXFLAGS) -I $(SDK_HOME)/include -I $(SDK_HOME)/examples/HelperLibraries -fPIC -shared -Wall -g -std=c++11 -lpcrecpp -lpcre -D_GLIBCXX_USE_CXX11_ABI=0
 ALL_CXXFLAGS += -DLOADER_DEBUG=$(LOADER_DEBUG)
