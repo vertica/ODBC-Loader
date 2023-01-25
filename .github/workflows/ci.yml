@@ -49,7 +49,7 @@ jobs:
       run: |
         wget https://downloads.mysql.com/archives/get/p/10/file/mysql-connector-odbc-8.0.31-1.el7.x86_64.rpm
         docker exec -w /var/odbc-loader -u root vertica_docker rpm -i mysql-connector-odbc-8.0.31-1.el7.x86_64.rpm
-        docker exec -w /var/odbc-loader -u root vertica_docker cp odbc*.ini ~/
+        docker exec -w /var/odbc-loader -u root vertica_docker cp tests/config/odbc*.ini ~/
     - name: Run Tests
       run: |
         docker exec -w /var/odbc-loader -u dbadmin vertica_docker /bin/bash -c "source /opt/rh/devtoolset-7/enable; \
