@@ -13,11 +13,19 @@ jobs:
 
     steps:
     - uses: actions/checkout@v3
+    - name: Set up MySQL server
+      run: |
+        docker run -d -p 3306:3306 -e MYSQL_ALLOW_EMPTY_PASSWORD=yes --name test-mysql mysql:8.0
+        docker exec -u root -d test-mysql mysql -u root -e "CREATE DATABASE testdb;"
+        docker exec -u root -d test-mysql mysql -u root testdb -e "set time zone to 'EST';"
+        docker exec -u root -d test-mysql mysql -u root testdb -e "CREATE TABLE test_source (i integer, b boolean, f float, v varchar(32), c char(32), lv varchar(9999), bn binary(32), vb varbinary(32), lvb varbinary(9999), d date, t time, ts timestamp null, tz varchar(80), tsz varchar(80), n numeric(20,4));"
+        docker exec -u root -d test-mysql /bin/bash -c "(echo \"INSERT INTO test_source VALUES (null, null, null, null, null, null, null, null, null, null, null, null, null, null, null);\"; for i in \`seq 1 9\`; do echo \"INSERT INTO test_source VALUES (\$i, 1, \$i.5, 'test \$i', 'test \$i', 'test \$i', 'test \$i', 'test \$i', 'test \$i', '\$((\$i+11))00/1/\$i', '4:0\$i', '2038-01-0\$i 03:14:07', '1:2\$i:00', 'June 1, \$((\$i+11))00 03:2\$i EST', '123456.7890');\"; done) | mysql -u root testdb"
     - name: Set up a Vertica server
       timeout-minutes: 15
       run: |
         docker run -d -p 5433:5433 -p 5444:5444 \
           -v ${{ github.workspace }}:/var/odbc-loader \
+          --add-host=host.docker.internal:host-gateway \
           --name vertica_docker \
           vertica/vertica-ce:12.0.2-0
         echo "Vertica startup ..."
@@ -28,7 +36,6 @@ jobs:
         echo "Vertica is up"
         docker exec -u dbadmin vertica_docker /opt/vertica/bin/vsql -c "\l"
         docker exec -u dbadmin vertica_docker /opt/vertica/bin/vsql -c "select version()"
-        docker exec -u dbadmin vertica_docker ls /var/odbc-loader
     - name: Build & Install UDx
       run: |
         docker exec -u root vertica_docker yum -y install centos-release-scl
@@ -38,3 +45,12 @@ jobs:
         docker exec -w /var/odbc-loader -u dbadmin vertica_docker /bin/bash -c "source /opt/rh/devtoolset-7/enable; \
         make; \
         make install"
+    - name: Install ODBC clients
+      run: |
+        wget https://downloads.mysql.com/archives/get/p/10/file/mysql-connector-odbc-8.0.31-1.el7.x86_64.rpm
+        docker exec -w /var/odbc-loader -u root vertica_docker rpm -i mysql-connector-odbc-8.0.31-1.el7.x86_64.rpm
+        docker exec -w /var/odbc-loader -u root vertica_docker cp odbc*.ini ~/
+    - name: Run Tests
+      run: |
+        docker exec -w /var/odbc-loader -u dbadmin vertica_docker /bin/bash -c "source /opt/rh/devtoolset-7/enable; \
+        make test; \

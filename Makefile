@@ -13,7 +13,7 @@ build: $(TARGET)/ODBCLoader.so
 ## See targets below for actual build logic
 
 clean:
-	rm build/ODBCLoader.so
+	rm $(TARGET)/ODBCLoader.so
 
 install: build
 	# install ODBCLoader
@@ -23,25 +23,34 @@ uninstall:
 	# uninstall ODBCLoader
 	@$(VSQL) -f ddl/uninstall.sql
 
-test:
+example:
 	@# Try uninstalling first, just in case we have a stale version around
 	-@$(MAKE) -s uninstall >/dev/null 2>&1
 	@$(MAKE) --no-print-dir install
 	@# Use bash's "trap" to uninstall and still return an error
-	@trap '$(MAKE) --no-print-dir uninstall' EXIT; $(MAKE) --no-print-dir test_impl
+	@trap '$(MAKE) --no-print-dir uninstall' EXIT; $(MAKE) --no-print-dir test_example
 
-test_impl:
+test_example:
 	# run tests
-	@$(VSQL) -f examples/sample_usage.sql >Tests.actual 2>&1
+	@$(VSQL) -f examples/sample_usage.sql > examples/Tests.actual 2>&1
 	@# filter out variable messages (i.e., mariadb vs mysql)
-	@diff -u Tests.out <(perl -pe 's/^vsql:[\/_:\w\.]* /vsql: /; \
+	@diff -u examples/Tests.out <(perl -pe 's/^vsql:[\/_:\w\.]* /vsql: /; \
 	              s/\[ODBC[^\]]*\]/[...]/g; \
 		      s/\[mysql[^\]]*\]/[...]/g; \
 		      s/(Error parsing .* )\(.*\)$$/$$1(...)/; \
-		      s/mariadb/MySQL/ig; ' Tests.actual)
+		      s/mariadb/MySQL/ig; ' examples/Tests.actual)
 	@echo ALL TESTS SUCCESSFUL
 
-.PHONY: build clean install uninstall test
+test:
+	@$(VSQL) -f tests/copy_test.sql > tests/copy_test.out 2>&1
+	@diff -u tests/expected/copy_test.out <(perl -pe 's/^vsql:[\/_:\w\.]* /vsql: /; \
+	              s/\[ODBC[^\]]*\]/[...]/g; \
+		      s/\[mysql[^\]]*\]/[...]/g; \
+		      s/(Error parsing .* )\(.*\)$$/$$1(...)/; \
+		      s/mariadb/MySQL/ig; ' tests/copy_test.out)
+	@echo ALL TESTS SUCCESSFUL
+
+.PHONY: build clean install uninstall example test_example test
 
 
 ## Actual build target
