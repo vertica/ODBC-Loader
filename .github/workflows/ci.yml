@@ -51,4 +51,4 @@ jobs:
         docker exec -w /var/odbc-loader -u root vertica_docker rpm -i mysql-connector-odbc-8.0.31-1.el7.x86_64.rpm
     - name: Run Tests
       run: |
-        docker exec -e ODBCSYSINI=/var/odbc-loader/tests/config -u dbadmin vertica_docker make test
+        docker exec -e ODBCSYSINI=/var/odbc-loader/tests/config -w /var/odbc-loader -u dbadmin vertica_docker make test
