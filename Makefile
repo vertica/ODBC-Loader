@@ -42,12 +42,12 @@ test_example:
 	@echo ALL TESTS SUCCESSFUL
 
 test:
-	@$(VSQL) -f tests/copy_test.sql > tests/copy_test.out 2>&1
+	@$(VSQL) -f tests/copy_test.sql > $(TMPDIR)/copy_test.out 2>&1
 	@diff -u tests/expected/copy_test.out <(perl -pe 's/^vsql:[\/_:\w\.]* /vsql: /; \
 	              s/\[ODBC[^\]]*\]/[...]/g; \
 		      s/\[mysql[^\]]*\]/[...]/g; \
 		      s/(Error parsing .* )\(.*\)$$/$$1(...)/; \
-		      s/mariadb/MySQL/ig; ' tests/copy_test.out)
+		      s/mariadb/MySQL/ig; ' $(TMPDIR)/copy_test.out)
 	@echo ALL TESTS SUCCESSFUL
 
 .PHONY: build clean install uninstall example test_example test
