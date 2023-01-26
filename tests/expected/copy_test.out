@@ -1,14 +1,25 @@
 Timing is on.
 Pager usage is off.
+Timing is off.
 SET
-Time: First fetch (0 rows): 0.612 ms. All rows formatted: 0.639 ms
 CREATE TABLE
-Time: First fetch (0 rows): 4.927 ms. All rows formatted: 4.946 ms
-vsql:tests/copy_test.sql:8: ERROR 3399:  Failure in UDx RPC call InvokeSetupUDL(): Error calling setupUDL() in User Defined Object [ODBCLoader] at [ODBCLoader.cpp:250], error code: 0, message: ODBC Error: SQLDriverConnect() failed with error code IM002, native code 0 [[unixODBC][Driver Manager]Data source name not found, and no default driver specified]
- i | b | f | v | c | lv | bn | vb | lvb | d | t | ts | tz | tsz | n 
----+---+---+---+---+----+----+----+-----+---+---+----+----+-----+---
-(0 rows)
+ Rows Loaded 
+-------------
+          10
+(1 row)
 
-Time: First fetch (0 rows): 4.753 ms. All rows formatted: 4.788 ms
+ i | b |  f  |   v    |   c    |   lv   |       bn       |   vb   |  lvb   |     d      |    t     |         ts          |     tz      |          tsz           |      n      
+---+---+-----+--------+--------+--------+----------------+--------+--------+------------+----------+---------------------+-------------+------------------------+-------------
+   |   |     |        |        |        |                |        |        |            |          |                     |             |                        |            
+ 1 | t | 1.5 | test 1 | test 1 | test 1 | test 1\000\000 | test 1 | test 1 | 1200-01-01 | 04:01:00 | 2038-01-01 03:14:07 | 01:21:00-05 | 1200-06-01 03:21:00-05 | 123456.7890
+ 2 | t | 2.5 | test 2 | test 2 | test 2 | test 2\000\000 | test 2 | test 2 | 1300-01-02 | 04:02:00 | 2038-01-02 03:14:07 | 01:22:00-05 | 1300-06-01 03:22:00-05 | 123456.7890
+ 3 | t | 3.5 | test 3 | test 3 | test 3 | test 3\000\000 | test 3 | test 3 | 1400-01-03 | 04:03:00 | 2038-01-03 03:14:07 | 01:23:00-05 | 1400-06-01 03:23:00-05 | 123456.7890
+ 4 | t | 4.5 | test 4 | test 4 | test 4 | test 4\000\000 | test 4 | test 4 | 1500-01-04 | 04:04:00 | 2038-01-04 03:14:07 | 01:24:00-05 | 1500-06-01 03:24:00-05 | 123456.7890
+ 5 | t | 5.5 | test 5 | test 5 | test 5 | test 5\000\000 | test 5 | test 5 | 1600-01-05 | 04:05:00 | 2038-01-05 03:14:07 | 01:25:00-05 | 1600-06-01 03:25:00-05 | 123456.7890
+ 6 | t | 6.5 | test 6 | test 6 | test 6 | test 6\000\000 | test 6 | test 6 | 1700-01-06 | 04:06:00 | 2038-01-06 03:14:07 | 01:26:00-05 | 1700-06-01 03:26:00-05 | 123456.7890
+ 7 | t | 7.5 | test 7 | test 7 | test 7 | test 7\000\000 | test 7 | test 7 | 1800-01-07 | 04:07:00 | 2038-01-07 03:14:07 | 01:27:00-05 | 1800-06-01 03:27:00-05 | 123456.7890
+ 8 | t | 8.5 | test 8 | test 8 | test 8 | test 8\000\000 | test 8 | test 8 | 1900-01-08 | 04:08:00 | 2038-01-08 03:14:07 | 01:28:00-05 | 1900-06-01 03:28:00-05 | 123456.7890
+ 9 | t | 9.5 | test 9 | test 9 | test 9 | test 9\000\000 | test 9 | test 9 | 2000-01-09 | 04:09:00 | 2038-01-09 03:14:07 | 01:29:00-05 | 2000-06-01 03:29:00-05 | 123456.7890
+(10 rows)
+
 DROP TABLE
-Time: First fetch (0 rows): 4.588 ms. All rows formatted: 4.613 ms

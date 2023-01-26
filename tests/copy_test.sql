@@ -1,3 +1,5 @@
+\timing off
+
 -- Set output to a fixed timezone regardless of where this is being tested
 set time zone to 'EST';
 
