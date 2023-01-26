@@ -17,7 +17,7 @@ jobs:
       run: |
         docker run -d -p 3306:3306 -e MYSQL_ALLOW_EMPTY_PASSWORD=yes --name test-mysql mysql:8.0
         echo "MySQL startup ..."
-        until docker exec vertica_docker mysql -u root -e "SELECT 1;"; do \
+        until docker exec test-mysql mysql -u root -e "SELECT 1;"; do \
           echo "..."; \
           sleep 1; \
         done;
