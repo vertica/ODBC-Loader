@@ -284,6 +284,7 @@ Driver=/usr/lib64/libmyodbc8a.so
 UsageCount=1
 ```
 
-License
-Apache 2.0 License, please see LICENSE for details.
+## License
+
+Apache 2.0 License, please see `LICENSE` for details.
 
