@@ -1,4 +1,7 @@
-﻿## INTRODUCTION
+[![License](https://img.shields.io/badge/License-Apache%202.0-orange.svg)](https://opensource.org/licenses/Apache-2.0)
+[![test status](https://github.com/vertica/ODBC-Loader/actions/workflows/ci.yml/badge.svg)](https://github.com/vertica/ODBC-Loader/actions/workflows/ci.yml)
+
+## INTRODUCTION
 This package contains two User-Defined Load functions, **ODBCSource()** and **ODBCLoader()**, that can be used to:
 - load data directly from a remote database
 - run queries against remote databases from Vertica (for example to join local Vertica-managed tables with MySQL, PostgreSQL, etc.)
@@ -281,5 +284,7 @@ Driver=/usr/lib64/libmyodbc8a.so
 UsageCount=1
 ```
 
+## License
 
+Apache 2.0 License, please see `LICENSE` for details.
 
