@@ -33,7 +33,7 @@ jobs:
           -v ${{ github.workspace }}:/var/odbc-loader \
           --add-host=host.docker.internal:host-gateway \
           --name vertica_docker \
-          vertica/vertica-ce:12.0.2-0
+          vertica/vertica-ce:12.0.4-0
         echo "Vertica startup ..."
         until docker exec vertica_docker test -f /data/vertica/VMart/agent_start.out; do \
           echo "..."; \
