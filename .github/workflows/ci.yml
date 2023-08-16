@@ -30,7 +30,6 @@ jobs:
       run: |
         docker run -d -p 5433:5433 -p 5444:5444 \
           -e ODBCSYSINI=/var/odbc-loader/tests/config \
-          -v ${{ github.workspace }}:/var/odbc-loader \
           --add-host=host.docker.internal:host-gateway \
           --name vertica_docker \
           vertica/vertica-ce:23.3.0-0
@@ -48,12 +47,14 @@ jobs:
         docker exec -u root vertica_docker yum -y install devtoolset-7
         docker exec -u root vertica_docker yum -y install unixODBC-devel
         docker exec -u root vertica_docker yum -y install pcre-devel
+        docker cp ${{ github.workspace }} vertica_docker:/var/odbc-loader
+        docker exec -u dbadmin vertica_docker /bin/bash -c "sudo chown -R dbadmin:verticadba /var/odbc-loader"
         docker exec -w /var/odbc-loader -u dbadmin vertica_docker /bin/bash -c "source /opt/rh/devtoolset-7/enable; \
         make; \
         make install"
     - name: Install ODBC clients
       run: |
-        wget https://downloads.mysql.com/archives/get/p/10/file/mysql-connector-odbc-8.0.31-1.el7.x86_64.rpm
+        docker exec -w /var/odbc-loader -u root vertica_docker wget https://downloads.mysql.com/archives/get/p/10/file/mysql-connector-odbc-8.0.31-1.el7.x86_64.rpm
         docker exec -w /var/odbc-loader -u root vertica_docker rpm -i mysql-connector-odbc-8.0.31-1.el7.x86_64.rpm
     - name: Run Tests
       run: |

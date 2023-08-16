@@ -47,7 +47,7 @@ COPY myschema.myverticatable
 ;
 ```
 where ``rowset`` is an optional parameter to define the number of rows fetched from the remote database in each SQLFetch() call (default = 100). Increasing this parameter can improve the performance but will also increase memory usage.
- 
+
 This will cause Vertica to connect to the remote database identified by the given "connect" string and execute the given query.  It will then fetch the results of the query and load them into the table ``myschema.myverticatable``.
 
 ``myverticatable`` must have the same number of columns as ``remote_table``.  The column types must also match up, or the ODBC driver for the remote database must be able to cast the column types to the Vertica types.  If necessary, you can always explicitly cast on the remote side by modifying the query, or on the local side with a Vertica COPY expression.
@@ -184,10 +184,11 @@ The following error has been reported, during the deloyment phase, on a few Linu
 undefined symbol: _ZNK7pcrecpp2RE13GlobalReplaceERKNS_11StringPieceEPSs
 ```
 
-To fix this issue you might want to...
+#### To fix this issue you might want to...
 
 **STEP 1: get rid of the standard pcre packages**:
 Remove ``pcre-devel`` and ``pcre-cpp`` packages (if installed) using the appropriate package management commands. For example:
+
 ```
 # yum remove pcre-devel pcre-cpp
 ```
@@ -203,6 +204,30 @@ Remove ``pcre-devel`` and ``pcre-cpp`` packages (if installed) using the appropr
 **STEP 3: update you ld.so config and recreate its cache**:
 ```
 # echo "/usr/local/lib" > /etc/ld.so.conf.d/local.conf && rm /etc/ld.so.cache && ldconfig
+```
+
+#### But if existing version PCRE must be kept, you could...
+
+**STEP 1:  install PCRE from sources to a dedicated location**:
+```
+# tar xzvf pcre-8.45.tar.gz
+# cd pcre-8.45
+# ./configure CXXFLAGS='-std=c++11 -D_GLIBCXX_USE_CXX11_ABI=0' --prefix=/opt/pcre
+# make && make install
+```
+
+**STEP 2: set PATHs for PCRE header files and libraries**:
+```
+echo 'export LD_LIBRARY_PATH=/opt/pcre/lib:${LD_LIBRARY_PATH}' >> /home/dbadmin/.bashrc
+
+export CPLUS_INCLUDE_PATH=/opt/pcre/include:${CPLUS_INCLUDE_PATH}
+export LIBRARY_PATH=/opt/pcre/lib:${LIBRARY_PATH}
+export LD_LIBRARY_PATH=/opt/pcre/lib:${LD_LIBRARY_PATH}
+
+# restart vertica database to effect settings
+admintools -t stop_db -d testdb; admintools -t start_db -d testdb
+
+# Building and installing the library as mentioned before
 ```
 
 ## Sample ODBC Configurations
