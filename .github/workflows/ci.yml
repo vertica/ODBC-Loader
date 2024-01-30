@@ -51,7 +51,7 @@ jobs:
         docker exec -u root vertica_docker yum -y install pcre-devel
         docker cp ${{ github.workspace }} vertica_docker:/var/odbc-loader
         docker exec -u dbadmin vertica_docker /bin/bash -c "sudo chown -R dbadmin:verticadba /var/odbc-loader"
-        docker exec -w /var/odbc-loader -u dbadmin vertica_docker /bin/bash -c "source /opt/rh/devtoolset-7/enable; \
+        docker exec -w /var/odbc-loader -u dbadmin vertica_docker /bin/bash -c "source /opt/rh/devtoolset-7/enable"; \
         make; \
         make install"
     - name: Install ODBC clients
