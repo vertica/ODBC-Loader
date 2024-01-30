@@ -56,8 +56,8 @@ jobs:
         make install"
     - name: Install ODBC clients
       run: |
-        docker exec -w /var/odbc-loader -u root vertica_docker wget https://downloads.mysql.com/archives/get/p/10/file/mysql-connector-odbc-8.0.31-1.el7.x86_64.rpm
-        docker exec -w /var/odbc-loader -u root vertica_docker rpm -i mysql-connector-odbc-8.0.31-1.el7.x86_64.rpm
+        docker exec -w /var/odbc-loader -u root vertica_docker wget https://downloads.mysql.com/archives/get/p/10/file/https://downloads.mysql.com/archives/get/p/10/file/mysql-connector-odbc-8.2.0-1.el7.src.rpm
+        docker exec -w /var/odbc-loader -u root vertica_docker rpm -i https://downloads.mysql.com/archives/get/p/10/file/mysql-connector-odbc-8.2.0-1.el7.src.rpm
     - name: Run Tests
       run: |
         docker exec -w /var/odbc-loader -u dbadmin vertica_docker make test
