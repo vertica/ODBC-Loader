@@ -6,7 +6,7 @@ VSQL ?= /opt/vertica/bin/vsql
 LOADER_DEBUG = 0
 TARGET ?= ./lib
 
-ALL_CXXFLAGS := $(CXXFLAGS) -I $(SDK_HOME)/include -I $(SDK_HOME)/examples/HelperLibraries -fPIC -shared -Wall -g -std=c++11 -D_GLIBCXX_USE_CXX11_ABI=0
+ALL_CXXFLAGS := $(CXXFLAGS) -I $(SDK_HOME)/include -I $(SDK_HOME)/examples/HelperLibraries -fPIC -shared -Wall -g -std=c++11 -D_GLIBCXX_USE_CXX11_ABI=1
 ALL_CXXFLAGS += -DLOADER_DEBUG=$(LOADER_DEBUG)
 
 build: $(TARGET)/ODBCLoader.so
