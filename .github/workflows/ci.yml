@@ -52,7 +52,7 @@ jobs:
         docker cp ${{ github.workspace }} vertica_docker:/var/odbc-loader
         docker exec -u root vertica_docker /bin/bash -c "sudo chown -R dbadmin:verticadba /var/odbc-loader"
         docker exec -u root -w /var/odbc-loader vertica_docker dnf install -y make
-        docker exec -u dbadmin -w /var/odbc-loader vertica_docker scl enable gcc-toolset-9 "bash -c 'make; make install'"
+        docker exec -u dbadmin -w /var/odbc-loader vertica_docker scl enable gcc-toolset-9 "bash -c 'make CXXFLAGS=\"-D_GLIBCXX_USE_CXX11_ABI=1\"; make install'"
 
     - name: Install ODBC clients
       run: |
