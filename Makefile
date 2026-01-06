@@ -3,6 +3,7 @@ TMPDIR ?= /tmp
 SDK_HOME ?= /opt/vertica/sdk
 SHELL = /bin/bash
 VSQL ?= /opt/vertica/bin/vsql
+VSQL_OPTS ?=
 LOADER_DEBUG = 0
 TARGET ?= ./lib
 
@@ -71,4 +72,4 @@ test:
 ## Actual build target
 $(TARGET)/ODBCLoader.so: ODBCLoader.cpp $(SDK_HOME)/include/Vertica.cpp $(SDK_HOME)/include/BuildInfo.h
 	mkdir -p $(TARGET)
-	$(CXX) $(ALL_CXXFLAGS) -o $@ $(SDK_HOME)/include/Vertica.cpp ODBCLoader.cpp -lodbc -lpcrecpp -lpcre
+	$(CXX) $(ALL_CXXFLAGS) -o $@ $(SDK_HOME)/include/Vertica.cpp ODBCLoader.cpp -lodbc

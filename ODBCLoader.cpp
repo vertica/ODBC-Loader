@@ -12,7 +12,7 @@
 #include <iostream>
 #include <vector>
 #include <sstream>
-#include <pcrecpp.h>
+#include <regex>
 
 // To deal with TimeTz and TimestampTz.
 // No standard native-SQL representation for these,
@@ -32,13 +32,13 @@
 #define DEF_ROWSET  100     // Default rowset
 #define MAX_PRELEN  2048    // Max predicate length
 #define MAX_PRENUM  10      // Max predicate number
-#define REG_CASTRM  R"(::\w+(\(.*?\))*)"
-#define REG_ANYMTC  R"(\s*=\s*ANY\s*\(ARRAY\[(.*)\])"
-#define REG_ANYREP  R"( IN(\1)"
+#define REG_CASTRM  R"(::\w+(\([^()]*\))*)"
+#define REG_ANYMTC  R"(\s*=\s*ANY\s*\(ARRAY\[([^\]]*)\])"
+#define REG_ANYREP  " IN($1)"
 #define REG_TILDEM  R"(\s*~~\s*)"
-#define REG_TILDER  R"( LIKE )"
+#define REG_TILDER  " LIKE "
 #define REG_ENDSCO  R"(\s*;\s*$)"
-#define REG_QUERYP  R"(^\s*\(*\s*override_query\s*<\s*'\s*(.*)\s*'.*$)"
+#define REG_QUERYP  R"(^\s*\(*\s*override_query\s*<\s*'\s*([\s\S]*)\s*'[\s\S]*$)"
 
 using namespace Vertica;
 
@@ -539,20 +539,27 @@ public:
 #if LOADER_DEBUG
   srvInterface.log("DEBUG predicate [%s] length=%zu, string=<%s>", pred, strlen(mpred.c_str()), mpred.c_str());
 #endif
-                if ( pcrecpp::RE(REG_QUERYP, pcrecpp::RE_Options(PCRE_DOTALL)).FullMatch(mpred) ) {
-                    pcrecpp::RE(REG_QUERYP, pcrecpp::RE_Options(PCRE_DOTALL)).GlobalReplace("\\1", &mpred) ;
-                    query = mpred ;
-                    oq_flag = true ;
+                {
+                    static const std::regex re_query(REG_QUERYP, std::regex::ECMAScript | std::regex::icase);
+                    static const std::regex re_any(REG_ANYMTC, std::regex::ECMAScript | std::regex::icase);
+                    static const std::regex re_tilde(REG_TILDEM, std::regex::ECMAScript | std::regex::icase);
+
+                    std::smatch m;
+                    if (std::regex_match(mpred, m, re_query)) {
+                        mpred = m[1].str();
+                        query = mpred ;
+                        oq_flag = true ;
 #if LOADER_DEBUG
   srvInterface.log("DEBUG new query length=%zu, new query string=<%s>",query.length(),  query.c_str());
 #endif
-                } else if ( src_rfilter ) {
-                        pcrecpp::RE(REG_ANYMTC).GlobalReplace(REG_ANYREP, &mpred) ;     // to replace ANY(ARRAY()) with IN()
-                        pcrecpp::RE(REG_TILDEM).GlobalReplace(REG_TILDER, &mpred) ;     // to replace ~~ with LIKE
+                    } else if ( src_rfilter ) {
+                        mpred = std::regex_replace(mpred, re_any, REG_ANYREP);     // to replace ANY(ARRAY()) with IN()
+                        mpred = std::regex_replace(mpred, re_tilde, REG_TILDER);  // to replace ~~ with LIKE
                         if ( l++ ) 
                             predicates += " AND " + mpred ;
                         else
                             predicates += " WHERE " + mpred ;
+                    }
                 }
             } else {
                 break ;
@@ -560,7 +567,10 @@ public:
         }
 
         // Remove ending semicolon from "query" (if any)
-        pcrecpp::RE(REG_ENDSCO).GlobalReplace("", &query) ;
+        {
+            static const std::regex re_end(REG_ENDSCO, std::regex::ECMAScript);
+            query = std::regex_replace(query, re_end, "");
+        }
 
         // Check "hidden" parameters __query_col_name__ and __query_col_idx__ to filter out columns
         if ( src_cfilter ) {
@@ -581,7 +591,10 @@ srvInterface.log("-----> External Table Columns, colInTable=<%d>", colInTable);
                    }
 
                    // MF to remove Vertica casts (::<data_type>)
-                   pcrecpp::RE(REG_CASTRM).GlobalReplace("", &slist) ;
+                   {
+                       static const std::regex re_cast(REG_CASTRM, std::regex::ECMAScript);
+                       slist = std::regex_replace(slist, re_cast, "");
+                   }
                    query = "SELECT " + slist + " FROM ( " + query + " ) sq" ;
                } else {
                    query = "SELECT " +
