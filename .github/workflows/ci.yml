@@ -2,64 +2,212 @@ name: CI
 
 on:
   push:
-    branches: [ "main" ]
+    branches: ["main"]
   pull_request:
-    branches: [ "main" ]
-  # Allows you to run this workflow manually from the Actions tab
+    branches: ["main"]
   workflow_dispatch:
 
 jobs:
   build:
-
     runs-on: ubuntu-latest
 
     steps:
-    - uses: actions/checkout@v3
-    - name: Set up MySQL server
-      run: |
-        docker run -d -p 3306:3306 -e MYSQL_ALLOW_EMPTY_PASSWORD=yes --name test-mysql mysql:8.0
-        echo "MySQL startup ..."
-        until docker exec test-mysql mysql -u root -e "SELECT 1;"; do \
-          echo "..."; \
-          sleep 1; \
-        done;
-        docker exec -u root test-mysql mysql -u root -e "CREATE DATABASE testdb;"
-        docker exec -u root test-mysql mysql -u root testdb -e "CREATE TABLE test_source (i integer, b boolean, f float, v varchar(32), c char(32), lv varchar(9999), bn binary(32), vb varbinary(32), lvb varbinary(9999), d date, t time, ts timestamp null, tz varchar(80), tsz varchar(80), n numeric(20,4));"
-        docker exec -u root test-mysql /bin/bash -c "(echo \"INSERT INTO test_source VALUES (null, null, null, null, null, null, null, null, null, null, null, null, null, null, null);\"; for i in \`seq 1 9\`; do echo \"INSERT INTO test_source VALUES (\$i, 1, \$i.5, 'test \$i', 'test \$i', 'test \$i', 'test \$i', 'test \$i', 'test \$i', '\$((\$i+11))00/1/\$i', '4:0\$i', '2038-01-0\$i 03:14:07', '1:2\$i:00', 'June 1, \$((\$i+11))00 03:2\$i EST', '123456.7890');\"; done) | mysql -u root testdb"
-        docker exec -u root test-mysql mysql -u root testdb -e "select * from test_source;"
-    - name: Set up a Vertica server
-      timeout-minutes: 15
-      run: |
-        docker run -d -p 5433:5433 -p 5444:5444 \
-          -e ODBCSYSINI=/var/odbc-loader/tests/config \
-          --add-host=host.docker.internal:host-gateway \
-          --name vertica_docker \
-          opentext/vertica-ce:24.2.0-1
-        echo "Vertica startup ..."
-        until docker exec vertica_docker test -f /data/vertica/VMart/agent_start.out; do \
-          echo "..."; \
-          sleep 3; \
-        done;
-        echo "Vertica is up"
-        docker exec -u dbadmin vertica_docker /opt/vertica/bin/vsql -c "\l"
-        docker exec -u dbadmin vertica_docker /opt/vertica/bin/vsql -c "select version()"
-    - name: Build & Install UDx
-      run: |
-        docker exec -u root vertica_docker dnf -y install gcc-toolset-9-gcc-c++.x86_64 
-        docker exec -u root vertica_docker dnf -y install unixODBC-devel
-        docker exec -u root vertica_docker dnf -y install pcre-devel
-        docker exec -u root vertica_docker dnf -y install perl
-        docker cp ${{ github.workspace }} vertica_docker:/var/odbc-loader
-        docker exec -u root vertica_docker /bin/bash -c "sudo chown -R dbadmin:verticadba /var/odbc-loader"
-        docker exec -u root -w /var/odbc-loader vertica_docker dnf install -y make
-        docker exec -u dbadmin -w /var/odbc-loader vertica_docker scl enable gcc-toolset-9 "bash -c 'make; make install'"
+      - uses: actions/checkout@v3
 
-    - name: Install ODBC clients
-      run: |
-        docker exec -w /var/odbc-loader -u root vertica_docker wget https://repo.mysql.com/mysql80-community-release-el8-9.noarch.rpm
-        docker exec -w /var/odbc-loader -u root vertica_docker dnf install -y mysql80-community-release-el8-9.noarch.rpm
-        docker exec -w /var/odbc-loader -u root vertica_docker dnf install -y mysql-connector-odbc
+      - name: Set up MySQL server
+        run: |
+          docker run -d -p 3306:3306 -e MYSQL_ALLOW_EMPTY_PASSWORD=yes --name test-mysql mysql:8.0
+          echo "MySQL startup ..."
+          until docker exec test-mysql mysql -u root -e "SELECT 1;"; do \
+            echo "..."; \
+            sleep 1; \
+          done;
+          docker exec -u root test-mysql mysql -u root -e "CREATE DATABASE testdb;"
+          docker exec -u root test-mysql mysql -u root testdb -e "CREATE TABLE test_source (i integer, b boolean, f float, v varchar(32), c char(32), lv varchar(9999), bn binary(32), vb varbinary(32), lvb varbinary(9999), d date, t time, ts timestamp null, tz varchar(80), tsz varchar(80), n numeric(20,4));"
+          docker exec -u root test-mysql /bin/bash -c "(echo \"INSERT INTO test_source VALUES (null, null, null, null, null, null, null, null, null, null, null, null, null, null, null);\"; for i in \`seq 1 9\`; do echo \"INSERT INTO test_source VALUES (\$i, 1, \$i.5, 'test \$i', 'test \$i', 'test \$i', 'test \$i', 'test \$i', 'test \$i', '\$((\$i+11))00/1/\$i', '4:0\$i', '2038-01-0\$i 03:14:07', '1:2\$i:00', 'June 1, \$((\$i+11))00 03:2\$i EST', '123456.7890');\"; done) | mysql -u root testdb"
+          docker exec -u root test-mysql mysql -u root testdb -e "select * from test_source;"
 
-    - name: Run Tests
-      run: |
-        docker exec -w /var/odbc-loader -u dbadmin vertica_docker make test
+      # ---------------------------
+      # Kubernetes (KinD) + Helm setup
+      # ---------------------------
+      - name: Set up Kubernetes (KinD)
+        uses: helm/kind-action@v1.8.0
+        with:
+          cluster_name: vertica-ci
+          node_image: kindest/node:v1.29.0
+
+      - name: Set up Helm
+        uses: azure/setup-helm@v3
+        with:
+          version: "3.11.3"
+
+      - name: Add Helm repositories
+        run: |
+          helm repo add vertica-charts https://vertica.github.io/charts
+          helm repo add bitnami https://charts.bitnami.com/bitnami || true
+          helm repo update
+
+      # ---------------------------
+      # MinIO Setup
+      # ---------------------------
+      - name: Install MinIO
+        run: |
+          kubectl create ns minio
+          cat <<'EOF' > minio.yaml
+          apiVersion: apps/v1
+          kind: Deployment
+          metadata:
+            name: minio
+            namespace: minio
+          spec:
+            replicas: 1
+            selector:
+              matchLabels:
+                app: minio
+            template:
+              metadata:
+                labels:
+                  app: minio
+              spec:
+                containers:
+                  - name: minio
+                    image: minio/minio:latest
+                    args: ["server", "/data"]
+                    env:
+                      - name: MINIO_ROOT_USER
+                        value: "minioadmin"
+                      - name: MINIO_ROOT_PASSWORD
+                        value: "minioadmin"
+                    ports:
+                      - containerPort: 9000
+                    volumeMounts:
+                      - name: data
+                        mountPath: /data
+                volumes:
+                  - name: data
+                    emptyDir: {}
+          ---
+          apiVersion: v1
+          kind: Service
+          metadata:
+            name: minio
+            namespace: minio
+          spec:
+            selector:
+              app: minio
+            ports:
+              - port: 9000
+                targetPort: 9000
+          EOF
+          kubectl apply -f minio.yaml
+          kubectl -n minio rollout status deployment/minio --timeout=2m
+          kubectl get pods -n minio -o wide || true
+          kubectl get svc -n minio || true
+
+      - name: Ensure MinIO bucket exists
+        run: |
+          kubectl run mc-client --rm -i --restart=Never \
+            --image=minio/mc:latest \
+            -n minio \
+            --command -- bash -c "
+              mc alias set localminio http://minio.minio.svc.cluster.local:9000 minioadmin minioadmin && \
+              mc mb --ignore-existing localminio/vertica-fleeting && \
+              mc ls localminio
+            "
+
+      - name: Create MinIO Secret
+        run: |
+          kubectl create ns my-verticadb-operator
+          kubectl delete secret communal-creds -n my-verticadb-operator --ignore-not-found
+          kubectl create secret generic communal-creds \
+            -n my-verticadb-operator \
+            --from-literal=accesskey="minioadmin" \
+            --from-literal=secretkey="minioadmin"
+          kubectl get secret communal-creds -n my-verticadb-operator -o yaml || true
+
+      # ---------------------------
+      # Vertica Operator + DB Deployment
+      # ---------------------------
+      - name: Install Vertica Operator
+        run: |
+          cat <<'EOF' > operator-values.yaml
+          installCRDs: true
+          controller:
+            extraEnv:
+              - name: AWS_REGION
+                value: "us-east-1"
+              - name: AWS_DEFAULT_REGION
+                value: "us-east-1"
+          EOF
+          helm upgrade --install vdb-op vertica-charts/verticadb-operator \
+            -n my-verticadb-operator -f operator-values.yaml --wait --timeout 10m
+          kubectl -n my-verticadb-operator get pods -o wide || true
+
+      - name: Deploy VerticaDB and per-node Services
+        run: |
+          cat <<'EOF' | kubectl apply -f -
+          apiVersion: vertica.com/v1
+          kind: VerticaDB
+          metadata:
+            name: verticadb-sample
+            namespace: my-verticadb-operator
+            annotations:
+              vertica.com/k-safety: "0"
+          spec:
+            image: opentext/vertica-k8s:latest
+            dbName: vdb
+            initPolicy: Create
+            communal:
+              path: s3://vertica-fleeting/mkottakota/
+              credentialSecret: communal-creds
+              endpoint: http://minio.minio.svc.cluster.local:9000
+              region: us-east-1
+            local:
+              dataPath: /data
+              depotPath: /depot
+            subclusters:
+              - name: defaultsubcluster
+                size: 1
+          EOF
+
+      - name: Wait for Vertica readiness
+        run: |
+          NS=my-verticadb-operator
+          SS=verticadb-sample-defaultsubcluster
+          POD=${SS}-0
+          for i in {1..30}; do
+            kubectl get pod ${POD} -n ${NS} && break || sleep 10
+          done
+          kubectl wait --for=condition=Ready pod/${POD} -n ${NS} --timeout=5m
+
+      - name: Build & Install UDX (Kubernetes)
+        run: |
+          NS=my-verticadb-operator
+          POD=verticadb-sample-defaultsubcluster-0
+          kubectl exec -n ${NS} ${POD} -- echo "Building UDX"
+
+      - name: Install MySQL ODBC client (Kubernetes)
+        run: |
+          NS=my-verticadb-operator
+          POD=verticadb-sample-defaultsubcluster-0
+
+          kubectl exec -n ${NS} ${POD} -- bash -c "
+            sudo dnf install -y \
+              https://repo.mysql.com/mysql80-community-release-el8-9.noarch.rpm &&
+            sudo dnf install -y \
+              mysql-connector-odbc \
+              unixODBC \
+              unixODBC-devel
+          "
+
+      - name: Run Tests (Kubernetes)
+        run: |
+          NS=my-verticadb-operator
+          POD=verticadb-sample-defaultsubcluster-0
+
+          kubectl exec -n ${NS} ${POD} -- bash -c "
+            sudo su - dbadmin -c '
+              cd /home/dbadmin/odbc-loader
+              make test
+            '
+          "
