@@ -13,7 +13,6 @@ Data retrieved from external databases is neither converted into an intermediate
 In order to install the ODBCLoader package you need to install on **all nodes of your Vertica cluster**:
 - an ODBC Driver Manager. This library has been tested with unixODBC. You need to install the development libraries (for example: ``yum install unixODBC-devel``)
 - the ODBC Drivers to interface the remote databases
-- Perl Compatible Regular Expression library (``yum install pcre-devel pcre-cpp``) 
 
 In order to compile the ODBCLoader you also have to setup a development environment as defined in the standard documentation ([Setting Up a Development Environment](https://www.vertica.com/docs/10.1.x/HTML/Content/Authoring/ExtendingVertica/UDx/DevEnvironment.htm)).
 
@@ -176,59 +175,6 @@ If the ODBC tracing was not enough you can (re)compie this library with LOADER_D
 $ rm -rf build && make install LOADER_DEBUG=1
 ```
 this will print extra messages in the Vertica log files (either ``UDxLogs/UDxFencedProcesses.log`` or ``vertica.log`` depending if the library was "FENCED" or "UNFENCED"). **Caution:** don't do this in production because it will flood your logs with debug messages and slowdown everything.
-
-### PCRE Missing symbols
-
-The following error has been reported, during the deloyment phase, on a few Linux Distributions:
-```
-undefined symbol: _ZNK7pcrecpp2RE13GlobalReplaceERKNS_11StringPieceEPSs
-```
-
-#### To fix this issue you might want to...
-
-**STEP 1: get rid of the standard pcre packages**:
-Remove ``pcre-devel`` and ``pcre-cpp`` packages (if installed) using the appropriate package management commands. For example:
-
-```
-# yum remove pcre-devel pcre-cpp
-```
-
-**STEP 2: install PCRE from sources**:
-```
-# tar xzvf pcre-8.45.tar.gz 
-# cd pcre-8.45
-# ./configure CXXFLAGS='-std=c++11 -D_GLIBCXX_USE_CXX11_ABI=0'
-# make && make install
-```
-
-**STEP 3: update you ld.so config and recreate its cache**:
-```
-# echo "/usr/local/lib" > /etc/ld.so.conf.d/local.conf && rm /etc/ld.so.cache && ldconfig
-```
-
-#### But if existing version PCRE must be kept, you could...
-
-**STEP 1:  install PCRE from sources to a dedicated location**:
-```
-# tar xzvf pcre-8.45.tar.gz
-# cd pcre-8.45
-# ./configure CXXFLAGS='-std=c++11 -D_GLIBCXX_USE_CXX11_ABI=0' --prefix=/opt/pcre
-# make && make install
-```
-
-**STEP 2: set PATHs for PCRE header files and libraries**:
-```
-echo 'export LD_LIBRARY_PATH=/opt/pcre/lib:${LD_LIBRARY_PATH}' >> /home/dbadmin/.bashrc
-
-export CPLUS_INCLUDE_PATH=/opt/pcre/include:${CPLUS_INCLUDE_PATH}
-export LIBRARY_PATH=/opt/pcre/lib:${LIBRARY_PATH}
-export LD_LIBRARY_PATH=/opt/pcre/lib:${LD_LIBRARY_PATH}
-
-# restart vertica database to effect settings
-admintools -t stop_db -d testdb; admintools -t start_db -d testdb
-
-# Building and installing the library as mentioned before
-```
 
 ## Sample ODBC Configurations
 The following two configuration files ```odbc.ini``` and ```odbcinst.ini``` have been used to define two data sources: **pmf** to connect to PostgreSQL and **mmf** to connect to MySQL:
