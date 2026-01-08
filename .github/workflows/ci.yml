@@ -196,8 +196,9 @@ jobs:
             dnf install -y mysql-connector-odbc unixODBC unixODBC-devel git make gcc
           "
 
-          kubectl cp ./odbc-loader toolbox:/root/odbc-loader -n $NS
-
+          kubectl cp ./odbc-loader "$NS"/toolbox:/root/odbc-loader
+          
+          echo "Running tests..."
           kubectl exec -n $NS toolbox -- bash -lc "
             cd /root/odbc-loader &&
             export VERTICA_HOST=verticadb-sample-defaultsubcluster-0.my-verticadb-operator.svc.cluster.local &&
