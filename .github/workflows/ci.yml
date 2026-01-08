@@ -2,9 +2,7 @@ name: CI
 
 on:
   push:
-    branches: ["main"]
   pull_request:
-    branches: ["main"]
   workflow_dispatch:
 
 jobs:
@@ -192,7 +190,7 @@ jobs:
           POD=verticadb-sample-defaultsubcluster-0
 
           kubectl exec -n ${NS} ${POD} \
-            -c server -- bash -c "
+            -c server --user=0 -- bash -lc "
             dnf install -y \
               https://repo.mysql.com/mysql80-community-release-el8-9.noarch.rpm &&
             dnf install -y \
