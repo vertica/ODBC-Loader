@@ -192,9 +192,9 @@ jobs:
           POD=verticadb-sample-defaultsubcluster-0
 
           kubectl exec -n ${NS} ${POD} -- bash -c "
-            sudo dnf install -y \
+            dnf install -y \
               https://repo.mysql.com/mysql80-community-release-el8-9.noarch.rpm &&
-            sudo dnf install -y \
+            dnf install -y \
               mysql-connector-odbc \
               unixODBC \
               unixODBC-devel
@@ -206,7 +206,7 @@ jobs:
           POD=verticadb-sample-defaultsubcluster-0
 
           kubectl exec -n ${NS} ${POD} -- bash -c "
-            sudo su - dbadmin -c '
+            su - dbadmin -c '
               cd /home/dbadmin/odbc-loader
               make test
             '
