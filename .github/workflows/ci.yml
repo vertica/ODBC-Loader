@@ -57,7 +57,10 @@ jobs:
           USER dbadmin
           EOF
           docker build -t vertica-odbc:latest .
-          kind load docker-image vertica-odbc:latest --name vertica-ci
+          # Tag with the fully-qualified name that kubelet will try to pull
+          docker tag vertica-odbc:latest docker.io/library/vertica-odbc:latest || true
+          # Load the fully-qualified image into Kind so kubelet finds it locally
+          kind load docker-image docker.io/library/vertica-odbc:latest --name vertica-ci || true
 
       - name: Verify custom image loaded into KinD node
         run: |
@@ -196,7 +199,10 @@ jobs:
             -n my-verticadb-operator -f operator-values.yaml --wait --timeout 10m
           kubectl -n my-verticadb-operator get pods -o wide || true
 
-      - name: Deploy VerticaDB and per-node Services
+      # ---------------------------
+      # Vertica DB
+      # ---------------------------
+      - name: Deploy VerticaDB
         run: |
           cat <<'EOF' | kubectl apply -f -
           apiVersion: vertica.com/v1
@@ -204,24 +210,18 @@ jobs:
           metadata:
             name: verticadb-sample
             namespace: my-verticadb-operator
-            annotations:
-              vertica.com/k-safety: "0"
           spec:
-            image: vertica-odbc:latest
-            imagePullPolicy: Never
+            image: docker.io/library/vertica-odbc:latest
+            imagePullPolicy: IfNotPresent
             dbName: vdb
             initPolicy: Create
             communal:
               path: s3://vertica-fleeting/mkottakota/
               credentialSecret: communal-creds
               endpoint: http://minio.minio.svc.cluster.local:9000
-              region: us-east-1
-            local:
-              dataPath: /data
-              depotPath: /depot
             subclusters:
               - name: defaultsubcluster
-                size: 1
+                size: 3
           EOF
 
       - name: Debug VerticaDB deployment
