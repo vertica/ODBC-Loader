@@ -44,14 +44,55 @@ jobs:
           cat <<EOF > Dockerfile
           FROM opentext/vertica-k8s:latest
           USER root
-          RUN dnf install -y https://repo.mysql.com/mysql80-community-release-el9-1.noarch.rpm
-          RUN dnf install -y mysql-connector-odbc unixODBC unixODBC-devel
-          RUN dnf install -y https://dl.fedoraproject.org/pub/epel/epel-release-latest-9.noarch.rpm
-          RUN dnf install -y gcc-toolset-12-gcc-c++ perl make
+          # Enable config manager and CRB (needed on some EL9 images for extra packages)
+          RUN dnf -y install dnf-plugins-core || true
+          RUN dnf config-manager --set-enabled crb || true
+          # Install base ODBC packages and common build deps
+          RUN dnf -y install unixODBC unixODBC-devel pcre-devel perl make || true
+          # Download MySQL ODBC RPM and install locally (use --nogpgcheck to avoid key issues)
+          RUN curl -L -o /tmp/mysql-connector-odbc.rpm https://dev.mysql.com/get/Downloads/Connector-ODBC/8.0/mysql-connector-odbc-8.0.36-1.el9.x86_64.rpm && \
+              dnf -y install /tmp/mysql-connector-odbc.rpm --nogpgcheck || true
+          # Install GCC toolset if available (not fatal if unavailable)
+          RUN dnf -y install gcc-toolset-12-gcc-c++ || true
           USER dbadmin
           EOF
           docker build -t vertica-odbc:latest .
           kind load docker-image vertica-odbc:latest --name vertica-ci
+
+      - name: Verify custom image loaded into KinD node
+        run: |
+          set -e
+          NODE=vertica-ci-control-plane
+          echo "Checking for vertica-odbc image on the runner (docker)"
+          if docker images | grep -q vertica-odbc; then
+            echo "Found vertica-odbc locally. Proceeding to check Kind node"
+          else
+            echo "ERROR: vertica-odbc image not found on the runner. Docker build may have failed."
+            echo "Run 'docker images | grep vertica-odbc' locally to inspect.";
+            docker images || true
+            exit 1
+          fi
+
+          echo "Checking for vertica-odbc image on Kind node: $NODE (containerd namespace k8s.io)"
+          # check containerd k8s.io namespace where kind stores images
+          if docker exec "$NODE" ctr -n k8s.io images ls | grep -q vertica-odbc; then
+            echo "vertica-odbc found in Kind node containerd (k8s.io namespace)"
+          else
+            echo "vertica-odbc NOT found in Kind node; attempting to reload the image into KinD"
+            kind load docker-image vertica-odbc:latest --name vertica-ci || true
+            echo "Listing images on Kind node after reload (ctr -n k8s.io images ls):"
+            docker exec "$NODE" ctr -n k8s.io images ls || true
+            # final check
+            if docker exec "$NODE" ctr -n k8s.io images ls | grep -q vertica-odbc; then
+              echo "vertica-odbc loaded successfully into Kind node after retry"
+            else
+              echo "ERROR: vertica-odbc image still not present on Kind node '$NODE'."
+              echo "Kind load may have failed or the control-plane container name differs."
+              echo "Available images on Kind node:"
+              docker exec "$NODE" ctr -n k8s.io images ls || true
+              exit 1
+            fi
+          fi
 
       - name: Add Helm repositories
         run: |
@@ -167,7 +208,7 @@ jobs:
               vertica.com/k-safety: "0"
           spec:
             image: vertica-odbc:latest
-            imagePullPolicy: IfNotPresent
+            imagePullPolicy: Never
             dbName: vdb
             initPolicy: Create
             communal:
@@ -232,5 +273,24 @@ jobs:
           POD=${SS}-0
           kubectl exec -n "$NS" ${POD} -c server -- bash -c 'cp /var/odbc-loader/tests/config/odbc.ini /etc/odbc.ini && cp /var/odbc-loader/tests/config/odbcinst.ini /etc/odbcinst.ini && cd /var/odbc-loader && make test'
       
-      
+      - name: Teardown resources
+        if: always()
+        run: |
+          set -e
+          # Delete the VerticaDB custom resource and wait a short while for cleanup
+          kubectl delete verticadb verticadb-sample -n my-verticadb-operator --ignore-not-found || true
+          sleep 3
+          # Uninstall the operator release (if installed)
+          helm uninstall vdb-op -n my-verticadb-operator || true
+          # Delete namespaces created for the CI run
+          kubectl delete ns my-verticadb-operator --ignore-not-found || true
+          kubectl delete ns minio --ignore-not-found || true
+          # Stop the local MySQL container used for tests
+          docker rm -f test-mysql || true
+          # Delete the KinD cluster created for this workflow
+          if command -v kind >/dev/null 2>&1; then
+            kind delete cluster --name vertica-ci || true
+          fi
+
+
 
