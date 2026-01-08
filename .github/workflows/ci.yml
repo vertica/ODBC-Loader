@@ -153,6 +153,9 @@ jobs:
               vertica.com/k-safety: "0"
           spec:
             image: opentext/vertica-k8s:latest
+            securityContext:
+              runAsUser: 0
+              allowPrivilegeEscalation: true
             dbName: vdb
             initPolicy: Create
             communal:
@@ -188,16 +191,11 @@ jobs:
         run: |
           NS=my-verticadb-operator
           POD=verticadb-sample-defaultsubcluster-0
-
-          kubectl exec -n ${NS} ${POD} \
-            -c server --user=0 -- bash -lc "
-            dnf install -y \
-              https://repo.mysql.com/mysql80-community-release-el8-9.noarch.rpm &&
-            dnf install -y \
-              mysql-connector-odbc \
-              unixODBC \
-              unixODBC-devel
-          "
+          kubectl exec -n "${NS}" "${POD}" -c server -- bash -lc '
+            id -u && id -g && whoami
+            dnf install -y https://repo.mysql.com/mysql80-community-release-el8-9.noarch.rpm &&
+            dnf install -y mysql-connector-odbc unixODBC unixODBC-devel
+          '
 
       - name: Run Tests (Kubernetes)
         run: |
