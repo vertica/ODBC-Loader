@@ -240,6 +240,28 @@ jobs:
           done
           kubectl wait --for=condition=Ready pod/${POD} -n ${NS} --timeout=5m
 
+      - name: Collect debug info (images & pod)
+        if: failure()
+        run: |
+          set -e
+          NODE=vertica-ci-control-plane
+          echo "--- Local docker images ---"
+          docker images || true
+          echo "--- Docker containers (showing kind control-plane candidate names) ---"
+          docker ps --format '{{.Names}} {{.Image}}' || true
+          echo "--- Inspecting Kind control-plane container: $NODE ---"
+          if docker ps --format '{{.Names}}' | grep -q "$NODE"; then
+            echo "Found control-plane container $NODE; listing containerd images (k8s.io namespace)"
+            docker exec "$NODE" ctr -n k8s.io images ls || true
+          else
+            echo "Control-plane container '$NODE' not found; listing available containers for debug:"
+            docker ps --format '{{.Names}} {{.Image}}' || true
+          fi
+
+          echo "--- Kubernetes: Vertica pod describe & recent events ---"
+          kubectl -n my-verticadb-operator describe pod verticadb-sample-defaultsubcluster-0 || true
+          kubectl -n my-verticadb-operator get events --sort-by=.metadata.creationTimestamp | tail -30 || true
+
       # ---------------------------
       # Build + Test
       # ---------------------------
