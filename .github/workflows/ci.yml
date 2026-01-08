@@ -191,7 +191,8 @@ jobs:
           NS=my-verticadb-operator
           POD=verticadb-sample-defaultsubcluster-0
 
-          kubectl exec -n ${NS} ${POD} -- bash -c "
+          kubectl exec -n ${NS} ${POD} \
+            -c server -- bash -c "
             dnf install -y \
               https://repo.mysql.com/mysql80-community-release-el8-9.noarch.rpm &&
             dnf install -y \
