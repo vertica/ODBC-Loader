@@ -39,6 +39,18 @@ jobs:
         with:
           version: "3.11.3"
 
+      - name: Build custom Vertica image with ODBC
+        run: |
+          cat <<EOF > Dockerfile
+          FROM opentext/vertica-k8s:latest
+          USER root
+          RUN dnf install -y https://repo.mysql.com/mysql80-community-release-el8-9.noarch.rpm && \
+              dnf install -y mysql-connector-odbc unixODBC unixODBC-devel
+          USER dbadmin
+          EOF
+          docker build -t vertica-odbc:latest .
+          kind load docker-image vertica-odbc:latest --name vertica-ci
+
       - name: Add Helm repositories
         run: |
           helm repo add vertica-charts https://vertica.github.io/charts
@@ -152,7 +164,7 @@ jobs:
             annotations:
               vertica.com/k-safety: "0"
           spec:
-            image: opentext/vertica-k8s:latest
+            image: vertica-odbc:latest
             dbName: vdb
             initPolicy: Create
             communal:
@@ -167,6 +179,12 @@ jobs:
               - name: defaultsubcluster
                 size: 1
           EOF
+
+      - name: Debug VerticaDB deployment
+        run: |
+          NS=my-verticadb-operator
+          kubectl describe verticadb verticadb-sample -n "$NS" || true
+          kubectl get events -n "$NS" --sort-by=.metadata.creationTimestamp | tail -20 || true
 
       - name: Wait for Vertica readiness
         run: |
@@ -190,6 +208,7 @@ jobs:
             -n "$NS" \
             --image=rockylinux:8 \
             --restart=Never \
+            --overrides='{"spec":{"securityContext":{"runAsUser":0}}}' \
             --command -- sleep infinity
           kubectl wait pod/toolbox -n "$NS" --for=condition=Ready --timeout=240s
       
@@ -217,31 +236,28 @@ jobs:
             scl enable gcc-toolset-9 "bash -lc '\''cd /var/odbc-loader && make'\''"
           '
       
-          # Install UDx (if install target connects to Vertica)
-          kubectl exec -n "$NS" toolbox -- bash -lc '
-            export VERTICA_HOST="verticadb-sample-defaultsubcluster.my-verticadb-operator.svc.cluster.local" &&
-            export VERTICA_USER="dbadmin" &&
-            export VERTICA_PASSWORD="" &&
-            scl enable gcc-toolset-9 "bash -lc '\''cd /var/odbc-loader && make install'\''"
-          '
+          # Copy lib and ddl to Vertica pod
+          kubectl cp toolbox:/var/odbc-loader/lib/ODBCLoader.so "$NS"/verticadb-sample-defaultsubcluster-0:/tmp/lib/ODBCLoader.so -c server -n "$NS"
+          kubectl cp toolbox:/var/odbc-loader/ddl/install.sql "$NS"/verticadb-sample-defaultsubcluster-0:/tmp/install.sql -c server -n "$NS"
       
-      - name: Run ODBC Loader Tests (toolbox)
+          # Install UDx from Vertica pod
+          kubectl exec -n "$NS" verticadb-sample-defaultsubcluster-0 -c server -- bash -c 'cd /tmp && /opt/vertica/bin/vsql -U dbadmin -d vdb -f install.sql'
+      
+      - name: Copy repo to Vertica pod for testing
         shell: bash
         run: |
           set -e
           NS=my-verticadb-operator
+          kubectl cp . "$NS"/verticadb-sample-defaultsubcluster-0:/var/odbc-loader -c server
       
-          kubectl exec -n "$NS" toolbox -- bash -lc '
-            dnf install -y https://repo.mysql.com/mysql80-community-release-el8-9.noarch.rpm &&
-            dnf install -y mysql-connector-odbc unixODBC unixODBC-devel git make gcc
-          '
-          kubectl exec -n "$NS" toolbox -- bash -lc '
-            cd /var/odbc-loader &&
-            export VERTICA_HOST="verticadb-sample-defaultsubcluster.my-verticadb-operator.svc.cluster.local" &&
-            export VERTICA_USER=dbadmin &&
-            export VERTICA_PASSWORD="" &&
-            make test
-          '
+      - name: Run ODBC Loader Tests in Vertica pod
+        shell: bash
+        run: |
+          set -e
+          NS=my-verticadb-operator
+          SS=verticadb-sample-defaultsubcluster
+          POD=${SS}-0
+          kubectl exec -n "$NS" ${POD} -c server -- bash -c 'cp /var/odbc-loader/tests/config/odbc.ini /etc/odbc.ini && cp /var/odbc-loader/tests/config/odbcinst.ini /etc/odbcinst.ini && cd /var/odbc-loader && make test'
       
       - name: Cleanup toolbox
         shell: bash
