@@ -9,6 +9,11 @@ jobs:
   build:
     runs-on: ubuntu-latest
 
+    env:
+      KIND_CLUSTER: vertica-ci
+      KIND_NODE_IMAGE: kindest/node:v1.29.0
+      VERTICA_IMAGE: vertica-odbc:latest
+
     steps:
       - uses: actions/checkout@v3
 
@@ -39,32 +44,36 @@ jobs:
         with:
           version: "3.11.3"
 
-      - name: Build custom Vertica image with ODBC
+      # ---------------------------
+      # Build Vertica UDx image
+      # ---------------------------
+      - name: Build custom Vertica UDx image
         run: |
-          cat <<EOF > Dockerfile
+          cat <<EOF > Dockerfile.udx-builder
           FROM opentext/vertica-k8s:latest
           USER root
-          
-          # Basic tools
+
+          # Install DNF plugins and makecache
+          RUN dnf -y install dnf-plugins-core \
+              && dnf -y makecache
+
+          # Install required packages
           RUN dnf -y install \
-            curl \
-            make \
-            perl \
-            unixODBC \
-            unixODBC-devel
+              gcc gcc-c++ make perl unixODBC-devel curl \
+              && dnf clean all
 
-          # Install MySQL ODBC connector via RPM
-          RUN curl -L -o /tmp/mysql-connector-odbc.rpm \
-            https://dev.mysql.com/get/Downloads/Connector-ODBC/8.0/mysql-connector-odbc-8.0.36-1.el9.x86_64.rpm && \
-            dnf -y install /tmp/mysql-connector-odbc.rpm --nogpgcheck && \
-            rm -f /tmp/mysql-connector-odbc.rpm
+          # Add MySQL repo (EL8) and install ODBC driver only
+          RUN dnf -y install https://repo.mysql.com/mysql80-community-release-el8-9.noarch.rpm && \
+              dnf -y install mysql-connector-odbc && \
+              dnf clean all
 
+          WORKDIR /var/odbc-loader
           USER dbadmin
           EOF
 
-          docker build -t vertica-odbc:latest .
-
-          kind load docker-image vertica-odbc:latest --name vertica-ci
+          docker build -t ${{ env.VERTICA_IMAGE }} -f Dockerfile.udx-builder .
+          docker tag ${{ env.VERTICA_IMAGE }} docker.io/library/${{ env.VERTICA_IMAGE }}
+          kind load docker-image docker.io/library/${{ env.VERTICA_IMAGE }} --name ${{ env.KIND_CLUSTER }}
 
       - name: Verify custom image loaded into KinD node
         run: |
@@ -204,7 +213,7 @@ jobs:
           kubectl -n my-verticadb-operator get pods -o wide || true
 
       # ---------------------------
-      # Vertica DB
+      # Deploy VerticaDB using local image
       # ---------------------------
       - name: Deploy VerticaDB
         run: |
@@ -217,7 +226,6 @@ jobs:
           spec:
             image: vertica-odbc:latest
             imagePullPolicy: Never
-
             dbName: vdb
             initPolicy: Create
             communal:
@@ -228,6 +236,7 @@ jobs:
               - name: defaultsubcluster
                 size: 3
           EOF
+          kubectl -n my-verticadb-operator get pods -o wide
 
       - name: Debug VerticaDB deployment
         run: |
