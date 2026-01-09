@@ -235,6 +235,7 @@ jobs:
           spec:
             image: $IMAGE
             imagePullPolicy: Never
+
             dbName: vdb
             initPolicy: Create
             communal:
