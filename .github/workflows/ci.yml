@@ -329,7 +329,7 @@ jobs:
       # ---------------------------
       - name: Build UDx using custom image
         run: |
-          docker run --rm -v $(pwd):/src vertica-odbc:ci bash -c '
+          docker run --rm -u root -v $(pwd):/src vertica-odbc:ci bash -c '
             cd /src &&
             scl enable gcc-toolset-12 "make"
           '
