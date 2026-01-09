@@ -214,21 +214,26 @@ jobs:
             -n my-verticadb-operator -f operator-values.yaml --wait --timeout 10m
           kubectl -n my-verticadb-operator get pods -o wide || true
 
-      # ---------------------------
-      # Deploy VerticaDB using local image
-      # ---------------------------
-      - name: Deploy VerticaDB
-        run: |
-          NS=my-verticadb-operator
-          STS=verticadb-sample-defaultsubcluster
-          cat <<'EOF' | kubectl apply -f -
+          #!/usr/bin/env bash
+          set -euo pipefail
+          
+          NS="my-verticadb-operator"
+          STS="verticadb-sample-defaultsubcluster"
+          CLUSTER_NAME="vertica-ci"
+          IMAGE="vertica-odbc:latest"
+          
+          echo "Loading local Docker image into KIND..."
+          kind load docker-image "$IMAGE" --name "$CLUSTER_NAME"
+          
+          echo "Applying VerticaDB CR..."
+          cat <<EOF | kubectl apply -f -
           apiVersion: vertica.com/v1
           kind: VerticaDB
           metadata:
             name: verticadb-sample
-            namespace: my-verticadb-operator
+            namespace: $NS
           spec:
-            image: vertica-odbc:latest
+            image: $IMAGE
             imagePullPolicy: Never
             dbName: vdb
             initPolicy: Create
@@ -240,39 +245,61 @@ jobs:
               - name: defaultsubcluster
                 size: 3
           EOF
-          echo "Waiting for StatefulSet ${STS}..."
+          
+          echo "Waiting for StatefulSet $STS to be created..."
           for i in {1..30}; do
-            kubectl get statefulset "$STS" -n "$NS" && break
-            sleep 2
+              if kubectl get statefulset "$STS" -n "$NS" &>/dev/null; then
+                  echo "StatefulSet $STS exists."
+                  break
+              fi
+              sleep 2
           done
-
-          echo "Deleting stuck pods to clear ImagePullBackOff cache"
-          kubectl delete pod -n "$NS" \
-            verticadb-sample-defaultsubcluster-0 \
-            verticadb-sample-defaultsubcluster-1 \
-            verticadb-sample-defaultsubcluster-2 || true
-
-            
-            echo "Waiting for Vertica pods to become ready..."
-            kubectl rollout status statefulset "$STS" -n "$NS" --timeout=20m
-
-            kubectl get pods -n "$NS" -o wide
-
-      - name: Debug VerticaDB deployment
-        run: |
-          NS=my-verticadb-operator
-          kubectl describe verticadb verticadb-sample -n "$NS" || true
-          kubectl get events -n "$NS" --sort-by=.metadata.creationTimestamp | tail -20 || true
-
-      - name: Wait for Vertica readiness
-        run: |
-          NS=my-verticadb-operator
-          SS=verticadb-sample-defaultsubcluster
-          POD=${SS}-0
-          for i in {1..30}; do
-            kubectl get pod ${POD} -n ${NS} && break || sleep 10
+          
+          echo "Waiting for Vertica pods to become ready (CI-friendly)..."
+          for i in {1..300}; do  # 10 min timeout
+              pods=$(kubectl get pods -l app.kubernetes.io/instance=verticadb-sample -n "$NS" -o json)
+              not_ready=$(echo "$pods" | jq '.items[] | select(.status.phase != "Running") | .metadata.name')
+              error_pods=$(echo "$pods" | jq '.items[] | select(.status.containerStatuses[]?.state.waiting?.reason=="ErrImagePull" or .status.containerStatuses[]?.state.waiting?.reason=="ImagePullBackOff") | .metadata.name')
+          
+              if [[ -n "$error_pods" ]]; then
+                  echo "Error pulling image for pod(s): $error_pods"
+                  kubectl get pods -n "$NS"
+                  exit 1
+              fi
+          
+              if [[ -z "$not_ready" ]]; then
+                  echo "All pods are running!"
+                  break
+              fi
+          
+              echo "Pods not ready yet: $not_ready"
+              # fetch last 10 lines of logs from all pods for debugging
+              for pod in $(echo "$pods" | jq -r '.items[].metadata.name'); do
+                  echo "Logs for $pod:"
+                  kubectl logs "$pod" -n "$NS" --tail=10 || true
+              done
+          
+              sleep 5
           done
-          kubectl wait --for=condition=Ready pod/${POD} -n ${NS} --timeout=5m
+          
+          kubectl get pods -n "$NS" -o wide
+          
+          
+      -   name: Debug VerticaDB deployment
+          run: |
+            NS=my-verticadb-operator
+            kubectl describe verticadb verticadb-sample -n "$NS" || true
+            kubectl get events -n "$NS" --sort-by=.metadata.creationTimestamp | tail -20 || true
+          
+      -   name: Wait for Vertica readiness
+          run: |
+            NS=my-verticadb-operator
+            SS=verticadb-sample-defaultsubcluster
+            POD=${SS}-0
+            for i in {1..30}; do
+              kubectl get pod ${POD} -n ${NS} && break || sleep 10
+            done
+            kubectl wait --for=condition=Ready pod/${POD} -n ${NS} --timeout=5m
 
       - name: Collect debug info (images & pod)
         if: failure()
