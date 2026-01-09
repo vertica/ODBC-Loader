@@ -334,13 +334,29 @@ jobs:
       # ---------------------------
       # Build + Test
       # ---------------------------
-      - name: Build UDx using custom image
+      - name: Build UDx with Symlinks
         run: |
-          docker run --rm -u root -v $(pwd):/src vertica-odbc:ci bash -c '
-            cd /src &&
-            scl enable gcc-toolset-12 "make"
-          '
-
+          docker run --rm -u root -v $(pwd):/src ${{ env.VERTICA_IMAGE }} bash -c "
+            cd /src && 
+            
+            # 1. Debug: Show where the SDK files actually are
+            echo 'Checking SDK location...'
+            ls -1 /opt/vertica/sdk/Vertica.cpp || echo 'Vertica.cpp not in /opt/vertica/sdk/'
+            
+            # 2. Create the directory and symlinks
+            mkdir -p /opt/vertica/sdk/include
+            ln -sf /opt/vertica/sdk/Vertica.h /opt/vertica/sdk/include/Vertica.h
+            ln -sf /opt/vertica/sdk/Vertica.cpp /opt/vertica/sdk/include/Vertica.cpp
+            ln -sf /opt/vertica/sdk/VerticaUDx.h /opt/vertica/sdk/include/VerticaUDx.h
+            
+            # 3. Build
+            if [ -f /opt/rh/gcc-toolset-12/enable ]; then
+              source /opt/rh/gcc-toolset-12/enable
+            fi
+            
+            make
+          "
+          
       - name: Copy lib and ddl to Vertica pod
         run: |
           NS=my-verticadb-operator
