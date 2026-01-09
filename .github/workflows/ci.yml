@@ -59,7 +59,7 @@ jobs:
 
           # Install required packages
           RUN dnf -y install \
-              gcc gcc-c++ make perl unixODBC-devel curl \
+              gcc gcc-c++ make perl unixODBC-devel \
               && dnf clean all
 
           # Add MySQL repo (EL8) and install ODBC driver only
@@ -207,6 +207,8 @@ jobs:
                 value: "us-east-1"
               - name: AWS_DEFAULT_REGION
                 value: "us-east-1"
+            
+            imagePullPolicy: IfNotPresent
           EOF
           helm upgrade --install vdb-op vertica-charts/verticadb-operator \
             -n my-verticadb-operator -f operator-values.yaml --wait --timeout 10m
