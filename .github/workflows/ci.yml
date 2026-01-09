@@ -219,6 +219,8 @@ jobs:
       # ---------------------------
       - name: Deploy VerticaDB
         run: |
+          NS=my-verticadb-operator
+          STS=verticadb-sample-defaultsubcluster
           cat <<'EOF' | kubectl apply -f -
           apiVersion: vertica.com/v1
           kind: VerticaDB
@@ -238,7 +240,23 @@ jobs:
               - name: defaultsubcluster
                 size: 3
           EOF
-          kubectl -n my-verticadb-operator get pods -o wide
+          echo "Waiting for StatefulSet ${STS}..."
+          for i in {1..30}; do
+            kubectl get statefulset "$STS" -n "$NS" && break
+            sleep 2
+          done
+
+          echo "Deleting stuck pods to clear ImagePullBackOff cache"
+          kubectl delete pod -n "$NS" \
+            verticadb-sample-defaultsubcluster-0 \
+            verticadb-sample-defaultsubcluster-1 \
+            verticadb-sample-defaultsubcluster-2 || true
+
+            
+            echo "Waiting for Vertica pods to become ready..."
+            kubectl rollout status statefulset "$STS" -n "$NS" --timeout=20m
+
+            kubectl get pods -n "$NS" -o wide
 
       - name: Debug VerticaDB deployment
         run: |
