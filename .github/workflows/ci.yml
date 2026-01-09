@@ -12,7 +12,7 @@ jobs:
     env:
       KIND_CLUSTER: vertica-ci
       KIND_NODE_IMAGE: kindest/node:v1.29.0
-      VERTICA_IMAGE: vertica-odbc:latest
+      VERTICA_IMAGE: vertica-odbc:ci
 
     steps:
       - uses: actions/checkout@v3
@@ -95,7 +95,7 @@ jobs:
             echo "vertica-odbc found in Kind node containerd (k8s.io namespace)"
           else
             echo "vertica-odbc NOT found in Kind node; attempting to reload the image into KinD"
-            kind load docker-image vertica-odbc:latest --name vertica-ci || true
+            kind load docker-image vertica-odbc:ci --name vertica-ci || true
             echo "Listing images on Kind node after reload (ctr -n k8s.io images ls):"
             docker exec "$NODE" ctr -n k8s.io images ls || true
             # final check
@@ -220,7 +220,7 @@ jobs:
           NS="my-verticadb-operator"
           STS="verticadb-sample-defaultsubcluster"
           CLUSTER_NAME="vertica-ci"
-          IMAGE="vertica-odbc:latest"
+          IMAGE="vertica-odbc:ci"
           
           echo "Loading local Docker image into KIND..."
           kind load docker-image "$IMAGE" --name "$CLUSTER_NAME"
@@ -329,7 +329,7 @@ jobs:
       # ---------------------------
       - name: Build UDx using custom image
         run: |
-          docker run --rm -v $(pwd):/src vertica-odbc:latest bash -c '
+          docker run --rm -v $(pwd):/src vertica-odbc:ci bash -c '
             cd /src &&
             scl enable gcc-toolset-12 "make"
           '
