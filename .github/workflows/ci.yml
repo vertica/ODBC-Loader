@@ -54,8 +54,15 @@ jobs:
           USER root
 
           # Install DNF plugins and makecache
-          RUN dnf -y install dnf-plugins-core \
-              && dnf -y makecache
+          RUN dnf -y install dnf-plugins-core && \
+              dnf -y makecache && \
+              dnf -y install \
+                scl-utils \
+                gcc-toolset-12-gcc \
+                gcc-toolset-12-gcc-c++ \
+                gcc-toolset-12-binutils \
+                make perl unixODBC-devel && \
+              dnf clean all
 
           # Install required packages
           RUN dnf -y install \
