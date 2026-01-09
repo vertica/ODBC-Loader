@@ -44,23 +44,27 @@ jobs:
           cat <<EOF > Dockerfile
           FROM opentext/vertica-k8s:latest
           USER root
-          # Enable config manager and CRB (needed on some EL9 images for extra packages)
-          RUN dnf -y install dnf-plugins-core || true
-          RUN dnf config-manager --set-enabled crb || true
-          # Install base ODBC packages and common build deps
-          RUN dnf -y install unixODBC unixODBC-devel pcre-devel perl make || true
-          # Download MySQL ODBC RPM and install locally (use --nogpgcheck to avoid key issues)
-          RUN curl -L -o /tmp/mysql-connector-odbc.rpm https://dev.mysql.com/get/Downloads/Connector-ODBC/8.0/mysql-connector-odbc-8.0.36-1.el9.x86_64.rpm && \
-              dnf -y install /tmp/mysql-connector-odbc.rpm --nogpgcheck || true
-          # Install GCC toolset if available (not fatal if unavailable)
-          RUN dnf -y install gcc-toolset-12-gcc-c++ || true
+          
+          # Basic tools
+          RUN dnf -y install \
+            curl \
+            make \
+            perl \
+            unixODBC \
+            unixODBC-devel
+
+          # Install MySQL ODBC connector via RPM
+          RUN curl -L -o /tmp/mysql-connector-odbc.rpm \
+            https://dev.mysql.com/get/Downloads/Connector-ODBC/8.0/mysql-connector-odbc-8.0.36-1.el9.x86_64.rpm && \
+            dnf -y install /tmp/mysql-connector-odbc.rpm --nogpgcheck && \
+            rm -f /tmp/mysql-connector-odbc.rpm
+
           USER dbadmin
           EOF
+
           docker build -t vertica-odbc:latest .
-          # Tag with the fully-qualified name that kubelet will try to pull
-          docker tag vertica-odbc:latest docker.io/library/vertica-odbc:latest || true
-          # Load the fully-qualified image into Kind so kubelet finds it locally
-          kind load docker-image docker.io/library/vertica-odbc:latest --name vertica-ci || true
+
+          kind load docker-image vertica-odbc:latest --name vertica-ci
 
       - name: Verify custom image loaded into KinD node
         run: |
@@ -211,8 +215,9 @@ jobs:
             name: verticadb-sample
             namespace: my-verticadb-operator
           spec:
-            image: docker.io/library/vertica-odbc:latest
-            imagePullPolicy: IfNotPresent
+            image: vertica-odbc:latest
+            imagePullPolicy: Never
+
             dbName: vdb
             initPolicy: Create
             communal:
