@@ -50,7 +50,7 @@ jobs:
       - name: Build custom Vertica UDx image
         run: |
           cat <<EOF > Dockerfile.udx-builder
-          FROM opentext/vertica-k8s:latest
+          FROM opentext/vertica-k8s:25.3.0-6
           USER root
 
           # Install DNF plugins and makecache
