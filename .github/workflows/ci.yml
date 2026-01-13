@@ -39,19 +39,20 @@ jobs:
           --name vertica_docker \
           mkottakota419/vertica-ci:latest
 
-        echo "Re-binding and Starting Vertica Database (mydb) ..."
+        echo "Creating fresh Vertica Database (mydb) ..."
         
-        # This command re-registers the existing files into the admintools.conf
+        # We use a simple create_db. 
+        # If /catalog or /data exist from your previous image, 
+        # we'll clear them first to ensure success.
+        docker exec -u root vertica_docker bash -c "rm -rf /catalog/* /data/*"
+        
         docker exec -u dbadmin vertica_docker admintools -t create_db \
-          --skip-prepare \
           -s localhost \
           -d mydb \
-          -p "MySecretPass" \
-          -c /catalog -D /data \
-          --force-rebuild
+          -p "MySecretPass"
         
         echo "Vertica is up"
-        docker exec -u dbadmin vertica_docker /opt/vertica/bin/vsql -c "select version()"
+        docker exec -u dbadmin vertica_docker vsql -c "SELECT version();"
 
     - name: Build & Install UDx
       run: |
