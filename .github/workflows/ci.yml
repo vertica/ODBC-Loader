@@ -98,5 +98,11 @@ jobs:
 
     - name: Run Tests
       run: |
-        # Ensure the test config knows where to find host.docker.internal (MySQL)
-        docker exec -w /var/odbc-loader -u dbadmin vertica_docker make test
+        # We need to tell the ODBC Driver Manager where to find your odbc.ini and odbcinst.ini
+        # These are located in /var/odbc-loader/tests/config based on your 'ls -R' earlier
+        
+        docker exec -w /var/odbc-loader \
+          -u dbadmin \
+          -e ODBCSYSINI=/var/odbc-loader/tests/config \
+          -e VSQL_PASSWORD="MySecretPass" \
+          vertica_docker make test
