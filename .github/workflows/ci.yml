@@ -98,17 +98,20 @@ jobs:
 
     - name: Run Tests
       run: |
-        # 1. Point the system-wide ODBC config to your repo files
-        # We use 'cat' to overwrite the system files with your test configs
+        # 1. Locate the actual MySQL ODBC driver file
+        # It might be libmyodbc8w.so, libmyodbc8a.so, or have a version suffix
+        MYSQL_DRIVER_PATH=$(docker exec vertica_docker find /usr/lib64 -name "libmyodbc*.so" | head -n 1)
+        echo "Found MySQL Driver at: $MYSQL_DRIVER_PATH"
+
+        # 2. Create a symlink so it matches what is in your odbcinst.ini
+        # If your odbcinst.ini expects /usr/lib64/libmyodbc8w.so, we make sure it's there
+        docker exec -u root vertica_docker ln -sf "$MYSQL_DRIVER_PATH" /usr/lib64/libmyodbc8w.so
+
+        # 3. Point system-wide ODBC config to your repo files
         docker exec -u root vertica_docker bash -c "cat /var/odbc-loader/tests/config/odbcinst.ini > /etc/odbcinst.ini"
         docker exec -u root vertica_docker bash -c "cat /var/odbc-loader/tests/config/odbc.ini > /etc/odbc.ini"
 
-        # 2. Verify the Driver Manager sees the DSN (helpful for logs)
-        echo "Verifying ODBC Data Sources:"
-        docker exec -u dbadmin vertica_docker odbcinst -q -s
-
-        # 3. Run the test
-        # We still provide VSQL_PASSWORD for the test script to talk to Vertica
+        # 4. Run the test
         docker exec -w /var/odbc-loader \
           -u dbadmin \
           -e VSQL_PASSWORD="MySecretPass" \
