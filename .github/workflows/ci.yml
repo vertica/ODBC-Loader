@@ -75,9 +75,14 @@ jobs:
         # 4. List files to verify (helps debugging)
         docker exec -u dbadmin -w /var/odbc-loader vertica_docker ls -R
         
-        # 5. Run the build
-        docker exec -u dbadmin -w /var/odbc-loader vertica_docker scl enable gcc-toolset-12 "make"
-        docker exec -u dbadmin -w /var/odbc-loader vertica_docker scl enable gcc-toolset-12 "make install"
+        # 5. Run the build (make)
+        docker exec -u dbadmin -w /var/odbc-loader vertica_docker \
+          scl enable gcc-toolset-12 "make"
+
+        # 6. Run install with the password provided to vsql
+        # We set PGPASSWORD which vsql recognizes automatically
+        docker exec -u dbadmin -w /var/odbc-loader -e PGPASSWORD="MySecretPass" vertica_docker \
+          scl enable gcc-toolset-12 "make install"
 
     - name: Install ODBC clients
       run: |
