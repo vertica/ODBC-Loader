@@ -80,16 +80,21 @@ jobs:
           scl enable gcc-toolset-12 "make"
 
         # 6. Run install with the password provided to vsql
-        # We set PGPASSWORD which vsql recognizes automatically
-        docker exec -u dbadmin -w /var/odbc-loader -e PGPASSWORD="MySecretPass" vertica_docker \
+        # We set VSQL_PASSWORD which vsql recognizes automatically
+        docker exec -u dbadmin -w /var/odbc-loader -e VSQL_PASSWORD="MySecretPass" vertica_docker \
           scl enable gcc-toolset-12 "make install"
 
     - name: Install ODBC clients
       run: |
-        # We still install the specific MySQL connector at runtime to keep image size down
+        # 1. Install wget so we can download the repo file
+        docker exec -u root vertica_docker dnf install -y wget
+
+        # 2. Download and install MySQL repo
         docker exec -w /var/odbc-loader -u root vertica_docker wget https://repo.mysql.com/mysql80-community-release-el8-9.noarch.rpm
         docker exec -w /var/odbc-loader -u root vertica_docker dnf install -y mysql80-community-release-el8-9.noarch.rpm
-        docker exec -w /var/odbc-loader -u root vertica_docker dnf install -y mysql-connector-odbc
+        
+        # 3. Install the connector (disabling GPG check to avoid prompt blocks)
+        docker exec -w /var/odbc-loader -u root vertica_docker dnf install -y --nogpgcheck mysql-connector-odbc
 
     - name: Run Tests
       run: |
