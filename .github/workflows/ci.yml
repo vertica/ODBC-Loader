@@ -39,9 +39,16 @@ jobs:
           --name vertica_docker \
           mkottakota419/vertica-ci:latest
 
-        echo "Starting Vertica Database (mydb) ..."
-        # Since the DB is created, we just need to start the process
-        docker exec -u dbadmin vertica_docker admintools -t start_db -d mydb -p "MySecretPass"
+        echo "Re-binding and Starting Vertica Database (mydb) ..."
+        
+        # This command re-registers the existing files into the admintools.conf
+        docker exec -u dbadmin vertica_docker admintools -t create_db \
+          --skip-prepare \
+          -s localhost \
+          -d mydb \
+          -p "MySecretPass" \
+          -c /catalog -D /data \
+          --force-rebuild
         
         echo "Vertica is up"
         docker exec -u dbadmin vertica_docker /opt/vertica/bin/vsql -c "select version()"
