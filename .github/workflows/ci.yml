@@ -32,27 +32,33 @@ jobs:
         docker exec -u root test-mysql /bin/bash -c "(echo \"INSERT INTO test_source VALUES (null, null, null, null, null, null, null, null, null, null, null, null, null, null, null);\"; for i in \`seq 1 9\`; do echo \"INSERT INTO test_source VALUES (\$i, 1, \$i.5, 'test \$i', 'test \$i', 'test \$i', 'test \$i', 'test \$i', 'test \$i', '\$((\$i+11))00/1/\$i', '4:0\$i', '2038-01-0\$i 03:14:07', '1:2\$i:00', 'June 1, \$((\$i+11))00 03:2\$i EST', '123456.7890');\"; done) | mysql -u root testdb"
 
     - name: Set up Vertica server (Private Image)
-      timeout-minutes: 10
+      timeout-minutes: 15
       run: |
         docker run -d -p 5433:5433 -p 5444:5444 \
           --add-host=host.docker.internal:host-gateway \
           --name vertica_docker \
           mkottakota419/vertica-ci:latest
 
-        echo "Creating fresh Vertica Database (mydb) ..."
+        echo "Preparing system environment..."
+        # 1. Install tools. 
+        # 2. Try to link, but don't fail if it's already there (|| true).
+        # 3. Verify the path exists so we can see it in the logs.
+        docker exec -u root vertica_docker bash -c "
+          dnf install -y iproute procps-ng && \
+          ln -sf /usr/sbin/ip /sbin/ip || true && \
+          ls -l /sbin/ip"
         
-        # We use a simple create_db. 
-        # If /catalog or /data exist from your previous image, 
-        # we'll clear them first to ensure success.
+        echo "Cleaning stale files..."
         docker exec -u root vertica_docker bash -c "rm -rf /catalog/* /data/*"
         
+        echo "Creating Vertica Database (mydb) ..."
         docker exec -u dbadmin vertica_docker admintools -t create_db \
           -s localhost \
           -d mydb \
           -p "MySecretPass"
         
         echo "Vertica is up"
-        docker exec -u dbadmin vertica_docker vsql -c "SELECT version();"
+        docker exec -u dbadmin vertica_docker vsql -w "MySecretPass" -c "SELECT version();"
 
     - name: Build & Install UDx
       run: |
