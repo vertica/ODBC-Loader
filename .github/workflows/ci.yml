@@ -62,12 +62,22 @@ jobs:
 
     - name: Build & Install UDx
       run: |
-        # All dnf installs (gcc, odbc-devel, make) are now skipped as they are in the image
-        docker cp ${{ github.workspace }} vertica_docker:/var/odbc-loader
-        docker exec -u root vertica_docker /bin/bash -c "chown -R dbadmin:verticadba /var/odbc-loader"
+        # 1. Create the directory
+        docker exec -u root vertica_docker mkdir -p /var/odbc-loader
         
-        # Using toolset-12 as installed in our Dockerfile
-        docker exec -u dbadmin -w /var/odbc-loader vertica_docker scl enable gcc-toolset-12 "bash -c 'make; make install'"
+        # 2. Copy the CONTENTS of the workspace (note the trailing /.)
+        # This ensures the Makefile is at /var/odbc-loader/Makefile
+        docker cp ${{ github.workspace }}/. vertica_docker:/var/odbc-loader
+        
+        # 3. Fix permissions
+        docker exec -u root vertica_docker chown -R dbadmin:verticadba /var/odbc-loader
+        
+        # 4. List files to verify (helps debugging)
+        docker exec -u dbadmin -w /var/odbc-loader vertica_docker ls -R
+        
+        # 5. Run the build
+        docker exec -u dbadmin -w /var/odbc-loader vertica_docker scl enable gcc-toolset-12 "make"
+        docker exec -u dbadmin -w /var/odbc-loader vertica_docker scl enable gcc-toolset-12 "make install"
 
     - name: Install ODBC clients
       run: |
