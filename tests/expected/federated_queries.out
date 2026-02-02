@@ -1,16 +1,14 @@
 Timing is off.
 SET
-
-CREATE EXTERNAL TABLE
-
- id  | name
------+----------
+CREATE TABLE
+ id  |  name   
+-----+---------
  101 | Alice
  102 | Bob
  103 | Charlie
 (3 rows)
 
- id
+ id  
 -----
  101
  102
@@ -18,16 +16,20 @@ CREATE EXTERNAL TABLE
 (3 rows)
 
 CREATE TABLE
-INSERT
- id  | name    | status
------+---------+---------
+ OUTPUT 
+--------
+      4
+(1 row)
+
+ id  |  name   |  status  
+-----+---------+----------
  101 | Alice   | inactive
  102 | Bob     | active
  103 | Charlie | inactive
 (3 rows)
 
- id  | name
------+----------
+ id  |  name   
+-----+---------
  101 | Alice
  102 | Bob
  103 | Charlie
