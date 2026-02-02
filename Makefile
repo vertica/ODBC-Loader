@@ -42,13 +42,28 @@ test_example:
 	@echo ALL TESTS SUCCESSFUL
 
 test:
-	@$(VSQL) -f tests/federated_queries.sql > $(TMPDIR)/federated_queries.out 2>&1
+	@echo "========================================="
+	@echo "Running ODBCLoader Test Suite"
+	@echo "========================================="
+	@echo ""
+	@echo "[*] Running Federated Queries Test..."
+	@echo ""
+	@$(VSQL) -f tests/federated_queries.sql 2>&1 | tee $(TMPDIR)/federated_queries.out | perl -pe 's/^vsql:[\/_:\w\.]* /vsql: /; \
+	              s/\[ODBC[^\]]*\]/[...]/g; \
+		      s/\[mysql[^\]]*\]/[...]/g; \
+		      s/(Error parsing .* )\(.*\)$$/$$1(...)/; \
+		      s/mariadb/MySQL/ig; '
+	@echo ""
+	@echo "[*] Validating test output..."
 	@diff -u tests/expected/federated_queries.out <(perl -pe 's/^vsql:[\/_:\w\.]* /vsql: /; \
 	              s/\[ODBC[^\]]*\]/[...]/g; \
 		      s/\[mysql[^\]]*\]/[...]/g; \
 		      s/(Error parsing .* )\(.*\)$$/$$1(...)/; \
-		      s/mariadb/MySQL/ig; ' $(TMPDIR)/federated_queries.out)
-	@echo ALL TESTS SUCCESSFUL
+		      s/mariadb/MySQL/ig; ' $(TMPDIR)/federated_queries.out) && echo "[✓] Test validation passed" || (echo "[✗] Test validation failed" && exit 1)
+	@echo ""
+	@echo "========================================="
+	@echo "✓ ALL TESTS SUCCESSFUL"
+	@echo "========================================="
 
 .PHONY: build clean install uninstall example test_example test
 
