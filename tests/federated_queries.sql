@@ -31,10 +31,10 @@ CREATE EXTERNAL TABLE public.epeople (
 SELECT * FROM public.epeople WHERE id > 100;
 
 -- Test 2: Query with column pruning
--- When only specific columns are selected, ODBCLoader optimizes the external query
--- to fetch only the required columns. Columns not in the Vertica query are replaced
--- with NULL values to match the External Table schema
--- Expected: Only id column is fetched from MySQL (name is replaced with NULL)
+-- When only specific columns are selected, ODBCLoader optimizes the external source query
+-- to fetch only the required columns, reducing data transfer from the remote database.
+-- Unselected columns are not fetched and do not appear in the query result.
+-- Expected: Only id column is fetched from MySQL (name column is not selected, so it is not fetched)
 SELECT id FROM public.epeople WHERE id > 100;
 
 -- Test 3: Federated join query
