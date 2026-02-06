@@ -27,15 +27,18 @@ jobs:
           echo "..."
           sleep 1
         done
-        docker exec -u root test-mysql mysql -u root -e "CREATE DATABASE testdb;"
-        docker exec -u root test-mysql mysql -u root testdb -e "CREATE TABLE test_source (i integer, b boolean, f float, v varchar(32), c char(32), lv varchar(9999), bn binary(32), vb varbinary(32), lvb varbinary(9999), d date, t time, ts timestamp null, tz varchar(80), tsz varchar(80), n numeric(20,4));"
-        docker exec -u root test-mysql /bin/bash -c "(echo \"INSERT INTO test_source VALUES (null, null, null, null, null, null, null, null, null, null, null, null, null, null, null);\"; for i in \`seq 1 9\`; do echo \"INSERT INTO test_source VALUES (\$i, 1, \$i.5, 'test \$i', 'test \$i', 'test \$i', 'test \$i', 'test \$i', 'test \$i', '\$((\$i+11))00/1/\$i', '4:0\$i', '2038-01-0\$i 03:14:07', '1:2\$i:00', 'June 1, \$((\$i+11))00 03:2\$i EST', '123456.7890');\"; done) | mysql -u root testdb"
-        docker exec -u root test-mysql mysql -u root testdb -e "CREATE TABLE people (id integer PRIMARY KEY, name varchar(20));"
-        docker exec -u root test-mysql mysql -u root testdb -e "INSERT INTO people VALUES (101, 'Alice'), (102, 'Bob'), (103, 'Charlie');"
+        echo "Setting up MySQL databases and tables..."
+        docker exec -u root test-mysql mysql -u root -e "CREATE DATABASE testdb;" || (echo "Failed to create testdb" && exit 1)
+        docker exec -u root test-mysql mysql -u root testdb -e "CREATE TABLE test_source (i integer, b boolean, f float, v varchar(32), c char(32), lv varchar(9999), bn binary(32), vb varbinary(32), lvb varbinary(9999), d date, t time, ts timestamp null, tz varchar(80), tsz varchar(80), n numeric(20,4));" || (echo "Failed to create test_source table" && exit 1)
+        docker exec -u root test-mysql /bin/bash -c "(echo \"INSERT INTO test_source VALUES (null, null, null, null, null, null, null, null, null, null, null, null, null, null, null);\"; for i in \`seq 1 9\`; do echo \"INSERT INTO test_source VALUES (\$i, 1, \$i.5, 'test \$i', 'test \$i', 'test \$i', 'test \$i', 'test \$i', 'test \$i', '\$((\$i+11))00/1/\$i', '4:0\$i', '2038-01-0\$i 03:14:07', '1:2\$i:00', 'June 1, \$((\$i+11))00 03:2\$i EST', '123456.7890');\"; done) | mysql -u root testdb" || (echo "Failed to insert test data" && exit 1)
+        docker exec -u root test-mysql mysql -u root testdb -e "CREATE TABLE people (id integer PRIMARY KEY, name varchar(20));" || (echo "Failed to create people table" && exit 1)
+        docker exec -u root test-mysql mysql -u root testdb -e "INSERT INTO people VALUES (101, 'Alice'), (102, 'Bob'), (103, 'Charlie');" || (echo "Failed to insert people data" && exit 1)
+        echo "MySQL setup completed successfully"
 
     - name: Set up Vertica server (Private Image)
       timeout-minutes: 15
       run: |
+        set -e
         docker run -d -p 5433:5433 -p 5444:5444 \
           --add-host=host.docker.internal:host-gateway \
           --name vertica_docker \
@@ -48,73 +51,81 @@ jobs:
         docker exec -u root vertica_docker bash -c "
           dnf install -y iproute procps-ng && \
           ln -sf /usr/sbin/ip /sbin/ip || true && \
-          ls -l /sbin/ip"
+          ls -l /sbin/ip" || (echo "Failed to prepare system environment" && exit 1)
         
         echo "Cleaning stale files..."
-        docker exec -u root vertica_docker bash -c "rm -rf /catalog/* /data/*"
+        docker exec -u root vertica_docker bash -c "rm -rf /catalog/* /data/*" || (echo "Failed to clean stale files" && exit 1)
         
         echo "Creating Vertica Database (mydb) ..."
         docker exec -u dbadmin vertica_docker admintools -t create_db \
           -s localhost \
-          -d mydb \
-          -p "MySecretPass"
+          -d mydb || (echo "Failed to create Vertica database" && exit 1)
         
-        echo "Vertica is up"
-        docker exec -u dbadmin vertica_docker vsql -w "MySecretPass" -c "SELECT version();"
+        echo "Vertica database is up"
+        docker exec -u dbadmin vertica_docker vsql -c "SELECT version();" || (echo "Failed to connect to Vertica database" && exit 1)
+        echo "Vertica is ready"
 
     - name: Build & Install UDx
       run: |
+        set -e
         # 1. Create the directory
-        docker exec -u root vertica_docker mkdir -p /var/odbc-loader
+        docker exec -u root vertica_docker mkdir -p /var/odbc-loader || (echo "Failed to create directory" && exit 1)
         
         # 2. Copy the CONTENTS of the workspace (note the trailing /.)
         # This ensures the Makefile is at /var/odbc-loader/Makefile
-        docker cp ${{ github.workspace }}/. vertica_docker:/var/odbc-loader
+        docker cp ${{ github.workspace }}/. vertica_docker:/var/odbc-loader || (echo "Failed to copy workspace" && exit 1)
         
         # 3. Fix permissions
-        docker exec -u root vertica_docker chown -R dbadmin:verticadba /var/odbc-loader
+        docker exec -u root vertica_docker chown -R dbadmin:verticadba /var/odbc-loader || (echo "Failed to change permissions" && exit 1)
         
         # 4. List files to verify (helps debugging)
-        docker exec -u dbadmin -w /var/odbc-loader vertica_docker ls -R
+        docker exec -u dbadmin -w /var/odbc-loader vertica_docker ls -R || (echo "Failed to list files" && exit 1)
         
         # 5. Run the build (make)
         docker exec -u dbadmin -w /var/odbc-loader vertica_docker \
-          scl enable gcc-toolset-12 "make"
+          scl enable gcc-toolset-12 "make" || (echo "Build failed" && exit 1)
 
-        # 6. Run install with the password provided to vsql
-        # We set VSQL_PASSWORD which vsql recognizes automatically
-        docker exec -u dbadmin -w /var/odbc-loader -e VSQL_PASSWORD="MySecretPass" vertica_docker \
-          scl enable gcc-toolset-12 "make install"
+        # 6. Run install without password (passwordless authentication)
+        docker exec -u dbadmin -w /var/odbc-loader vertica_docker \
+          scl enable gcc-toolset-12 "make install" || (echo "UDx installation failed" && exit 1)
+        echo "UDx build and installation successful"
 
     - name: Install ODBC clients
       run: |
+        set -e
         # 1. Install wget so we can download the repo file
-        docker exec -u root vertica_docker dnf install -y wget
+        docker exec -u root vertica_docker dnf install -y wget || (echo "Failed to install wget" && exit 1)
 
         # 2. Download and install MySQL repo
-        docker exec -w /var/odbc-loader -u root vertica_docker wget https://repo.mysql.com/mysql80-community-release-el8-9.noarch.rpm
-        docker exec -w /var/odbc-loader -u root vertica_docker dnf install -y mysql80-community-release-el8-9.noarch.rpm
+        docker exec -w /var/odbc-loader -u root vertica_docker wget https://repo.mysql.com/mysql80-community-release-el8-9.noarch.rpm || (echo "Failed to download MySQL repo" && exit 1)
+        docker exec -w /var/odbc-loader -u root vertica_docker dnf install -y mysql80-community-release-el8-9.noarch.rpm || (echo "Failed to install MySQL repo" && exit 1)
         
         # 3. Install the connector (disabling GPG check to avoid prompt blocks)
-        docker exec -w /var/odbc-loader -u root vertica_docker dnf install -y --nogpgcheck mysql-connector-odbc
+        docker exec -w /var/odbc-loader -u root vertica_docker dnf install -y --nogpgcheck mysql-connector-odbc || (echo "Failed to install MySQL connector" && exit 1)
+        echo "ODBC clients installed successfully"
 
     - name: Run Tests
       run: |
+        set -e
         # 1. Locate the actual MySQL ODBC driver file
         # It might be libmyodbc8w.so, libmyodbc8a.so, or have a version suffix
         MYSQL_DRIVER_PATH=$(docker exec vertica_docker find /usr/lib64 -name "libmyodbc*.so" | head -n 1)
+        if [ -z "$MYSQL_DRIVER_PATH" ]; then
+          echo "Error: MySQL ODBC driver not found"
+          exit 1
+        fi
         echo "Found MySQL Driver at: $MYSQL_DRIVER_PATH"
 
         # 2. Create a symlink so it matches what is in your odbcinst.ini
         # If your odbcinst.ini expects /usr/lib64/libmyodbc8w.so, we make sure it's there
-        docker exec -u root vertica_docker ln -sf "$MYSQL_DRIVER_PATH" /usr/lib64/libmyodbc8w.so
+        docker exec -u root vertica_docker ln -sf "$MYSQL_DRIVER_PATH" /usr/lib64/libmyodbc8w.so || (echo "Failed to create driver symlink" && exit 1)
 
         # 3. Point system-wide ODBC config to your repo files
-        docker exec -u root vertica_docker bash -c "cat /var/odbc-loader/tests/config/odbcinst.ini > /etc/odbcinst.ini"
-        docker exec -u root vertica_docker bash -c "cat /var/odbc-loader/tests/config/odbc.ini > /etc/odbc.ini"
+        docker exec -u root vertica_docker bash -c "cat /var/odbc-loader/tests/config/odbcinst.ini > /etc/odbcinst.ini" || (echo "Failed to configure odbcinst.ini" && exit 1)
+        docker exec -u root vertica_docker bash -c "cat /var/odbc-loader/tests/config/odbc.ini > /etc/odbc.ini" || (echo "Failed to configure odbc.ini" && exit 1)
 
-        # 4. Run the test
+        # 4. Run the test (passwordless Vertica connection)
         docker exec -w /var/odbc-loader \
           -u dbadmin \
-          -e VSQL_PASSWORD="MySecretPass" \
-          vertica_docker make test
+          vertica_docker make test || (echo "Tests failed" && exit 1)
+        echo "All tests passed"
