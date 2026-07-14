@@ -669,12 +669,13 @@ srvInterface.log("-----> External Table Columns, colInTable=<%d>", colInTable);
         vtype = (BaseDataOID *)srvInterface.allocator->alloc(numcols * sizeof(BaseDataOID)) ;
         stype = (uint32 *)srvInterface.allocator->alloc(numcols * sizeof(uint32)) ;
 
-        // Plain COPY path leaves vidx empty (no column filtering). Default it to
-        // identity mapping (0..numcols-1) so vidx.at(i) below is valid.
+        // Plain COPY leaves vidx empty. Default to identity mapping and set
+        // colInTable so the pre-null loop covers all columns.
         if (vidx.empty()) {
             for (SQLSMALLINT i = 0; i < numcols; i++) {
                 vidx.push_back(i);
             }
+            colInTable = numcols;
         }
 
         // Set up column-data buffers
