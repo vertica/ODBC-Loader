@@ -47,6 +47,21 @@ test:
 	@echo "Running ODBCLoader Test Suite"
 	@echo "========================================="
 	@echo ""
+	@echo "[*] Running Copy Test..."
+	@echo ""
+	@$(VSQL) -f tests/copy_test.sql 2>&1 | tee $(TMPDIR)/copy_test.out | perl -pe 's/^vsql:[\/_:\w\.]* /vsql: /; \
+	              s/\[ODBC[^\]]*\]/[...]/g; \
+		      s/\[mysql[^\]]*\]/[...]/g; \
+		      s/(Error parsing .* )\(.*\)$$/$$1(...)/; \
+		      s/mariadb/MySQL/ig; '
+	@echo ""
+	@echo "[*] Validating copy test output..."
+	@diff -u tests/expected/copy_test.out <(perl -pe 's/^vsql:[\/_:\w\.]* /vsql: /; \
+	              s/\[ODBC[^\]]*\]/[...]/g; \
+		      s/\[mysql[^\]]*\]/[...]/g; \
+		      s/(Error parsing .* )\(.*\)$$/$$1(...)/; \
+		      s/mariadb/MySQL/ig; ' $(TMPDIR)/copy_test.out) && echo "[✓] Copy test validation passed" || (echo "[✗] Copy test validation failed" && exit 1)
+	@echo ""
 	@echo "[*] Running Federated Queries Test..."
 	@echo ""
 	@$(VSQL) -f tests/federated_queries.sql 2>&1 | tee $(TMPDIR)/federated_queries.out | perl -pe 's/^vsql:[\/_:\w\.]* /vsql: /; \
