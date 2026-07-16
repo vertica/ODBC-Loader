@@ -574,9 +574,11 @@ public:
 
         // Check "hidden" parameters __query_col_name__ and __query_col_idx__ to filter out columns
         if ( src_cfilter ) {
-           if (srvInterface.getParamReader().containsParameter("__query_col_name__")) {
-               if (srvInterface.getParamReader().containsParameter("__query_col_idx__")) {
-                   colInTable = (int)colInfo.getColumnCount() ; 
+            // Only column-filter when the param is actually non-empty, a plain COPY sends it empty.
+            if (srvInterface.getParamReader().containsParameter("__query_col_name__") &&
+                !srvInterface.getParamReader().getStringRef("__query_col_name__").str().empty()) {
+                if (srvInterface.getParamReader().containsParameter("__query_col_idx__")) {
+                    colInTable = (int)colInfo.getColumnCount() ;
 #if LOADER_DEBUG
  srvInterface.log("DEBUG __query_col_name__=<%s>",srvInterface.getParamReader().getStringRef("__query_col_name__").str().c_str());
  srvInterface.log("DEBUG __query_col_idx__=<%s>",srvInterface.getParamReader().getStringRef("__query_col_idx__").str().c_str());
@@ -603,6 +605,9 @@ srvInterface.log("-----> External Table Columns, colInTable=<%d>", colInTable);
                            query  +
                            " ) sq" ;
                }
+            } else {
+                // Plain COPY: column-filter param present but empty -> load all columns.
+                query = "SELECT * FROM ( " + query + " ) sq" ;
             }
 
         } else {
@@ -664,6 +669,15 @@ srvInterface.log("-----> External Table Columns, colInTable=<%d>", colInTable);
         // Allocate space for Vertica data types OID and size
         vtype = (BaseDataOID *)srvInterface.allocator->alloc(numcols * sizeof(BaseDataOID)) ;
         stype = (uint32 *)srvInterface.allocator->alloc(numcols * sizeof(uint32)) ;
+
+        // Plain COPY leaves vidx empty. Default to identity mapping and set
+        // colInTable so the pre-null loop covers all columns.
+        if (vidx.empty()) {
+            for (SQLSMALLINT i = 0; i < numcols; i++) {
+                vidx.push_back(i);
+            }
+            colInTable = numcols;
+        }
 
         // Set up column-data buffers
         // Bind to the columns in question
