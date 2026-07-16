@@ -574,10 +574,11 @@ public:
 
         // Check "hidden" parameters __query_col_name__ and __query_col_idx__ to filter out columns
         if ( src_cfilter ) {
-           if (srvInterface.getParamReader().containsParameter("__query_col_name__") &&
-               !srvInterface.getParamReader().getStringRef("__query_col_name__").str().empty()) {
-               if (srvInterface.getParamReader().containsParameter("__query_col_idx__")) {
-                   colInTable = (int)colInfo.getColumnCount() ;
+            // Only column-filter when the param is actually non-empty, a plain COPY sends it empty.
+            if (srvInterface.getParamReader().containsParameter("__query_col_name__") &&
+                !srvInterface.getParamReader().getStringRef("__query_col_name__").str().empty()) {
+                if (srvInterface.getParamReader().containsParameter("__query_col_idx__")) {
+                    colInTable = (int)colInfo.getColumnCount() ;
 #if LOADER_DEBUG
  srvInterface.log("DEBUG __query_col_name__=<%s>",srvInterface.getParamReader().getStringRef("__query_col_name__").str().c_str());
  srvInterface.log("DEBUG __query_col_idx__=<%s>",srvInterface.getParamReader().getStringRef("__query_col_idx__").str().c_str());
