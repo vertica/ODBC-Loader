@@ -30,6 +30,9 @@
 #define MIN_ROWSET  1       // Min rowset value
 #define MAX_ROWSET  10000   // Max rowset value
 #define DEF_ROWSET  100     // Default rowset
+#define MIN_THREAD  1       // Min thread_count value
+#define MAX_THREAD  64      // Max thread_count value
+#define DEF_THREAD  1       // Default thread_count
 #define MAX_PRELEN  2048    // Max predicate length
 #define MAX_PRENUM  10      // Max predicate number
 #define REG_CASTRM  R"(::\w+(\([^()]*\))*)"
@@ -52,7 +55,7 @@ static inline TimeADT getTimeFromHMS(uint32 hour, uint8 min, uint8 sec) {
 
 class ODBCLoader : public UDParser {
 public:
-    ODBCLoader() : quirks(NoQuirks) {}
+    ODBCLoader() : currentSlice(0), quirks(NoQuirks) {}
 
     // Maximum length of diagnostic-message text
     // that we can receive from the ODBC driver.
@@ -86,6 +89,10 @@ private:
     SQLSMALLINT numcols;
     SQLULEN nfrows;		// Number of fetched rows
     size_t rowset;
+
+    // One SQL string per slice; a single entry means no split.
+    std::vector<std::string> sliceQueries;
+    int currentSlice;
 
     enum PerDBQuirks {
         NoQuirks = 0,
@@ -280,6 +287,120 @@ private:
         }
     }
 
+    // Strict base-10 parse; rejects non-integer input (text, dates, decimals).
+    static bool parseWholeInteger(const char *s, long long &out) {
+        if (s == NULL) return false;
+        while (*s == ' ') s++;
+        if (*s == '\0') return false;
+        char *end = NULL;
+        long long v = strtoll(s, &end, 10);
+        if (end == s) return false;             // no digits consumed
+        while (*end == ' ') end++;              // tolerate trailing spaces
+        if (*end != '\0') return false;         // trailing junk -> not an integer
+        out = v;
+        return true;
+    }
+
+    // Probes MIN/MAX split bounds; returns false on any error so the caller can fall back.
+    bool probeSplitBounds(ServerInterface &srvInterface, const std::string &baseQuery,
+                          const std::string &splitColumn, long long &lo, long long &hi) {
+        std::string probe = "SELECT MIN(" + splitColumn + "), MAX(" + splitColumn +
+                            ") FROM ( " + baseQuery + " ) t";
+        SQLHSTMT pstmt = SQL_NULL_HSTMT;
+        if (!SQL_SUCCEEDED(SQLAllocHandle(SQL_HANDLE_STMT, dbc, &pstmt))) {
+            return false;
+        }
+
+        bool ok = false;
+        if (SQL_SUCCEEDED(SQLExecDirect(pstmt, (SQLCHAR*)probe.c_str(), SQL_NTS))) {
+            char minbuf[128] = {0};
+            char maxbuf[128] = {0};
+            SQLLEN minlen = 0, maxlen = 0;
+            // Fetch as strings so we can validate integer-ness ourselves.
+            SQLBindCol(pstmt, 1, SQL_C_CHAR, minbuf, sizeof(minbuf), &minlen);
+            SQLBindCol(pstmt, 2, SQL_C_CHAR, maxbuf, sizeof(maxbuf), &maxlen);
+            if (SQL_SUCCEEDED(SQLFetch(pstmt)) &&
+                minlen != SQL_NULL_DATA && maxlen != SQL_NULL_DATA &&
+                parseWholeInteger(minbuf, lo) && parseWholeInteger(maxbuf, hi)) {
+                ok = (lo <= hi);
+            }
+        }
+
+        SQLFreeStmt(pstmt, SQL_CLOSE);
+        SQLFreeHandle(SQL_HANDLE_STMT, pstmt);
+        return ok;
+    }
+
+    // Builds per-slice queries; falls back to a single slice when a split is unavailable.
+    void buildSliceQueries(ServerInterface &srvInterface, const std::string &baseQuery,
+                           int threadCount, const std::string &splitColumn,
+                           const std::string &splitMethod) {
+        sliceQueries.clear();
+        currentSlice = 0;
+
+        // No split requested -> original single-connection path, unchanged.
+        if (splitColumn.empty() || threadCount <= 1) {
+            sliceQueries.push_back(baseQuery);
+            return;
+        }
+
+        // Bare identifiers only; anything else falls back to single-connection.
+        static const std::regex re_ident("^[A-Za-z_][A-Za-z0-9_]*$", std::regex::ECMAScript);
+        long long lo = 0, hi = 0;
+        if (!std::regex_match(splitColumn, re_ident) ||
+            !probeSplitBounds(srvInterface, baseQuery, splitColumn, lo, hi)) {
+            srvInterface.log("ODBC Loader: split_column '%s' is not a usable integer "
+                             "column; falling back to single-connection load",
+                             splitColumn.c_str());
+            sliceQueries.push_back(baseQuery);
+            return;
+        }
+
+        if (splitMethod == "modulo") {
+            // Modulo split; assumes non-negative keys.
+            for (int k = 0; k < threadCount; k++) {
+                std::ostringstream q;
+                q << "SELECT * FROM ( " << baseQuery << " ) t WHERE (MOD("
+                  << splitColumn << ", " << threadCount << ") = " << k << ")";
+                sliceQueries.push_back(q.str());
+            }
+        } else {
+            // Range split: contiguous [lo, hi] chunks; __int128 avoids overflow.
+            __int128 count = (__int128)hi - (__int128)lo + 1;
+            for (int k = 0; k < threadCount; k++) {
+                long long startIdx = (long long)((count * k) / threadCount);
+                long long endIdx   = (long long)((count * (k + 1)) / threadCount);
+                if (startIdx >= endIdx) continue;   // more slices than distinct values
+                long long sliceLo = lo + startIdx;
+                long long sliceHi = lo + endIdx - 1;
+                std::ostringstream q;
+                q << "SELECT * FROM ( " << baseQuery << " ) t WHERE (" << splitColumn
+                  << " BETWEEN " << sliceLo << " AND " << sliceHi << ")";
+                sliceQueries.push_back(q.str());
+            }
+        }
+
+        // NULL keys match no BETWEEN/MOD slice; keep them once on the last slice.
+        if (!sliceQueries.empty()) {
+            sliceQueries.back() += " OR " + splitColumn + " IS NULL";
+        }
+
+        if (sliceQueries.empty()) {         // defensive: never leave zero slices
+            sliceQueries.push_back(baseQuery);
+        }
+        srvInterface.log("ODBC Loader: split_column '%s' -> %zu slice(s) using %s method",
+                         splitColumn.c_str(), sliceQueries.size(),
+                         (splitMethod == "modulo") ? "modulo" : "range");
+    }
+
+    // Runs the next slice on the existing statement; column bindings persist.
+    void executeSlice(ServerInterface &srvInterface, const std::string &sliceQuery) {
+        SQLRETURN r = SQLFreeStmt(stmt, SQL_CLOSE);
+        handleReturnCode(srvInterface, r, SQL_HANDLE_STMT, stmt, "SQLFreeStmt(SQL_CLOSE)");
+        r = SQLExecDirect(stmt, (SQLCHAR*)sliceQuery.c_str(), SQL_NTS);
+        handleReturnCode(srvInterface, r, SQL_HANDLE_STMT, stmt, "SQLExecDirect()");
+    }
+
 public:
 
     virtual StreamState process(ServerInterface &srvInterface, DataBuffer &input, InputState input_state) {
@@ -463,6 +584,12 @@ public:
             handleReturnCode(srvInterface, fetchRet, SQL_HANDLE_STMT, stmt, "SQLFetch()");
         }
 
+        // Current slice drained; run the next one if any and keep going, else DONE.
+        if (currentSlice + 1 < (int)sliceQueries.size()) {
+            executeSlice(srvInterface, sliceQueries[++currentSlice]);
+            return KEEP_GOING;
+        }
+
         return DONE;
     }           // End PROCESS
 
@@ -528,6 +655,28 @@ public:
                 rowset = (size_t) rowset_param ;
         } else {
                 rowset = DEF_ROWSET ;	// use default if not set
+        }
+
+        // Check "thread_count" parameter (valid range MIN_THREAD..MAX_THREAD).
+        vint thread_count = DEF_THREAD ;
+        if (srvInterface.getParamReader().containsParameter("thread_count")) {
+            thread_count = srvInterface.getParamReader().getIntRef("thread_count") ;
+            if ( thread_count < MIN_THREAD || thread_count > MAX_THREAD )
+                vt_report_error(0, "Error:  Invalid thread_count=%zd. Permitted values between %d and %d", thread_count, MIN_THREAD, MAX_THREAD);
+        }
+
+        // Check "split_column" (bare identifier) and "split_method" ("range"/"modulo").
+        std::string split_column = "" ;
+        if (srvInterface.getParamReader().containsParameter("split_column")) {
+            split_column = srvInterface.getParamReader().getStringRef("split_column").str() ;
+        }
+        std::string split_method = "range" ;
+        if (srvInterface.getParamReader().containsParameter("split_method")) {
+            split_method = srvInterface.getParamReader().getStringRef("split_method").str() ;
+            for (size_t i = 0 ; i < split_method.size() ; i++) {
+                char c = split_method[i] ;
+                if (c >= 'A' && c <= 'Z') split_method[i] = c - 'A' + 'a' ;
+            }
         }
   
         // Check "hidden" parameters __pred_#__ to filter out rows
@@ -656,7 +805,9 @@ srvInterface.log("-----> External Table Columns, colInTable=<%d>", colInTable);
         r = SQLSetStmtAttr(stmt, SQL_ATTR_ROWS_FETCHED_PTR, &nfrows, 0) ;
         handleReturnCode(srvInterface, r, SQL_HANDLE_STMT, stmt, "SQLSetStmtAttr(SQL_ATTR_ROWS_FETCHED_PTR)");
 
-        r = SQLExecDirect(stmt, (SQLCHAR*)query.c_str(), SQL_NTS);
+        // Derive the split and run the first/only slice; unsplit path is unchanged.
+        buildSliceQueries(srvInterface, query, (int)thread_count, split_column, split_method);
+        r = SQLExecDirect(stmt, (SQLCHAR*)sliceQueries[currentSlice].c_str(), SQL_NTS);
         handleReturnCode(srvInterface, r, SQL_HANDLE_STMT, stmt, "SQLExecDirect()");
 
         r = SQLNumResultCols(stmt, &numcols);
@@ -745,6 +896,9 @@ public:
                 parameterTypes.addVarchar(MAX_PRELEN, pred);
         }
         parameterTypes.addInt("rowset");
+        parameterTypes.addInt("thread_count");
+        parameterTypes.addVarchar(128, "split_column");
+        parameterTypes.addVarchar(16, "split_method");
         parameterTypes.addBool("src_rfilter");
         parameterTypes.addBool("src_cfilter");
     }
