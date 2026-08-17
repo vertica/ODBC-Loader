@@ -55,7 +55,7 @@ static inline TimeADT getTimeFromHMS(uint32 hour, uint8 min, uint8 sec) {
 
 class ODBCLoader : public UDParser {
 public:
-    ODBCLoader() : currentSlice(0), quirks(NoQuirks) {}
+    ODBCLoader() : currentSlice(0), quirks(NoQuirks), modSupported(false) {}
 
     // Maximum length of diagnostic-message text
     // that we can receive from the ODBC driver.
@@ -100,6 +100,9 @@ private:
     };
 
     PerDBQuirks quirks;
+
+    // Whether the remote engine supports MOD(); set in setQuirksMode().
+    bool modSupported;
 
     // MF keeping this to re-use the code in the Fetch loop...
     struct Buf {
@@ -340,6 +343,9 @@ private:
 
         // No split requested -> original single-connection path, unchanged.
         if (splitColumn.empty() || threadCount <= 1) {
+            if (threadCount > 1 && splitColumn.empty()) {
+                srvInterface.log("ODBC Loader: thread_count=%d ignored because split_column is not set; single-connection load", threadCount);
+            }
             sliceQueries.push_back(baseQuery);
             return;
         }
@@ -349,19 +355,26 @@ private:
         long long lo = 0, hi = 0;
         if (!std::regex_match(splitColumn, re_ident) ||
             !probeSplitBounds(srvInterface, baseQuery, splitColumn, lo, hi)) {
-            srvInterface.log("ODBC Loader: split_column '%s' is not a usable integer "
-                             "column; falling back to single-connection load",
+            srvInterface.log("ODBC Loader: split_column '%s' unusable (missing, non-integer, reserved/quoted, or pruned); falling back to single-connection load",
                              splitColumn.c_str());
             sliceQueries.push_back(baseQuery);
             return;
         }
 
-        if (splitMethod == "modulo") {
-            // Modulo split; assumes non-negative keys.
+        // MOD() is engine-dependent; range is the portable default.
+        bool useModulo = (splitMethod == "modulo");
+        if (useModulo && !modSupported) {
+            srvInterface.log("ODBC Loader: modulo split not supported on this engine; downgraded to range split");
+            useModulo = false;
+        }
+
+        if (useModulo) {
+            // Double-MOD normalizes negative keys into 0..N-1.
             for (int k = 0; k < threadCount; k++) {
                 std::ostringstream q;
-                q << "SELECT * FROM ( " << baseQuery << " ) t WHERE (MOD("
-                  << splitColumn << ", " << threadCount << ") = " << k << ")";
+                q << "SELECT * FROM ( " << baseQuery << " ) t WHERE (MOD(MOD("
+                  << splitColumn << ", " << threadCount << ") + " << threadCount
+                  << ", " << threadCount << ") = " << k << ")";
                 sliceQueries.push_back(q.str());
             }
         } else {
@@ -390,10 +403,11 @@ private:
         }
         srvInterface.log("ODBC Loader: split_column '%s' -> %zu slice(s) using %s method",
                          splitColumn.c_str(), sliceQueries.size(),
-                         (splitMethod == "modulo") ? "modulo" : "range");
+                         useModulo ? "modulo" : "range");
     }
 
     // Runs the next slice on the existing statement; column bindings persist.
+    // TODO(Story 2 / US 5598915): real parallelism needs per-thread env/dbc/stmt handles + thread-safe write-back.
     void executeSlice(ServerInterface &srvInterface, const std::string &sliceQuery) {
         SQLRETURN r = SQLFreeStmt(stmt, SQL_CLOSE);
         handleReturnCode(srvInterface, r, SQL_HANDLE_STMT, stmt, "SQLFreeStmt(SQL_CLOSE)");
@@ -608,6 +622,20 @@ public:
         if (db_type == "ORCL") {
             quirks = Oracle;
         }
+
+        // MOD() is engine-dependent; range is the portable default. Mark MOD()
+        // supported only for known engines (Postgres, Oracle, MySQL).
+        char dbms[64];
+        memset(&dbms[0], 0, sizeof(dbms));
+        SQLGetInfo(dbc, SQL_DBMS_NAME, dbms, sizeof(dbms) - 1, NULL);
+        std::string dbms_name(dbms);
+        for (size_t i = 0; i < dbms_name.size(); i++) {
+            char c = dbms_name[i];
+            if (c >= 'A' && c <= 'Z') dbms_name[i] = c - 'A' + 'a';
+        }
+        modSupported = (dbms_name.find("postgres") != std::string::npos ||
+                        dbms_name.find("oracle")   != std::string::npos ||
+                        dbms_name.find("mysql")    != std::string::npos);
     }
 
     virtual void setup(ServerInterface &srvInterface, SizedColumnTypes &returnType) {
