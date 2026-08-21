@@ -13,6 +13,11 @@
 #include <vector>
 #include <sstream>
 #include <regex>
+#include <thread>
+#include <mutex>
+#include <condition_variable>
+#include <deque>
+#include <algorithm>
 
 // To deal with TimeTz and TimestampTz.
 // No standard native-SQL representation for these,
@@ -33,6 +38,8 @@
 #define MIN_THREAD  1       // Min thread_count value
 #define MAX_THREAD  64      // Max thread_count value
 #define DEF_THREAD  1       // Default thread_count
+#define MAX_QUEUE_BATCHES 8 // Queue depth; bounds buffered rows at 8 x rowset
+#define BATCHES_PER_BREAK 4 // Batches per process() call, to keep cancel checks frequent
 #define MAX_PRELEN  2048    // Max predicate length
 #define MAX_PRENUM  10      // Max predicate number
 #define REG_CASTRM  R"(::\w+(\([^()]*\))*)"
@@ -55,7 +62,8 @@ static inline TimeADT getTimeFromHMS(uint32 hour, uint8 min, uint8 sec) {
 
 class ODBCLoader : public UDParser {
 public:
-    ODBCLoader() : currentSlice(0), quirks(NoQuirks), modSupported(false) {}
+    ODBCLoader() : currentSlice(0), quirks(NoQuirks), modSupported(false),
+                   threaded(false), workersStarted(false), threadCountParam(DEF_THREAD) {}
 
     // Maximum length of diagnostic-message text
     // that we can receive from the ODBC driver.
@@ -122,8 +130,53 @@ private:
     // MF we want to determine Vertica/ODBC types & sizes once and for all...
     BaseDataOID *vtype ;  // Vertica types pointer
     uint32      *stype ;  // Vertica data type size
+    SQLSMALLINT *ctype ;  // ODBC C type; precomputed so workers never call the SDK for it
 
     StringParsers parser;
+
+    // Worker threads open their own connections with this same string.
+    std::string connect;
+
+    // ---- Threaded parallel-fetch state (US 5598915 + US 5602339) ----
+
+    // One column of one row, as raw driver bytes the main thread converts later.
+    struct Cell {
+        bool isNull;
+        SQLLEN lenIndicator;  // original driver length indicator (may be SQL_NTS)
+        std::string bytes;
+        Cell() : isNull(true), lenIndicator(0) {}
+    };
+    struct Batch {
+        std::vector<std::vector<Cell> > rows;
+    };
+
+    // One bounded queue shared by all workers; the main thread is the sole consumer.
+    struct BatchQueue {
+        std::mutex mtx;
+        std::condition_variable notFull;
+        std::condition_variable notEmpty;
+        std::deque<Batch> items;
+        size_t maxItems;
+        int activeProducers;    // workers not yet finished
+        bool shutdown;          // cancel/teardown: wake blocked workers
+        BatchQueue() : maxItems(MAX_QUEUE_BATCHES), activeProducers(0), shutdown(false) {}
+    };
+
+    BatchQueue queue;
+    std::vector<std::thread> workers;
+
+    // Per-worker error marshalling: captured as DATA, never thrown across threads.
+    struct WorkerStatus {
+        bool failed;
+        std::string message;    // driver message
+        std::string sqlstate;   // SQLSTATE
+        WorkerStatus() : failed(false) {}
+    };
+    std::vector<WorkerStatus> workerStatus;
+
+    bool threaded;          // true when running the multi-worker path
+    bool workersStarted;    // spawn workers only once across process() re-entry
+    int threadCountParam;   // validated thread_count; hard ceiling on workers
 
     // Gets the Vertica type of the specified column
     VerticaType getVerticaTypeOfCol(SQLSMALLINT colnum) {
@@ -407,7 +460,7 @@ private:
     }
 
     // Runs the next slice on the existing statement; column bindings persist.
-    // TODO(Story 2 / US 5598915): real parallelism needs per-thread env/dbc/stmt handles + thread-safe write-back.
+    // Single-slice path only (thread_count<=1 / no split / unusable split column).
     void executeSlice(ServerInterface &srvInterface, const std::string &sliceQuery) {
         SQLRETURN r = SQLFreeStmt(stmt, SQL_CLOSE);
         handleReturnCode(srvInterface, r, SQL_HANDLE_STMT, stmt, "SQLFreeStmt(SQL_CLOSE)");
@@ -415,9 +468,402 @@ private:
         handleReturnCode(srvInterface, r, SQL_HANDLE_STMT, stmt, "SQLExecDirect()");
     }
 
+    // Converts one already-fetched cell (raw driver bytes) into the writer; main
+    // thread only. NOTE: the single-slice loop in process() still has its own copy.
+    void emitCell(ServerInterface &srvInterface, SQLUSMALLINT i, SQLPOINTER buf, SQLLEN len) {
+        Buf data;
+        data.buf = buf;
+        data.len = len;
+        std::string rejectReason = "unrecognized syntax from remote database";
+
+        switch (vtype[i]) {
+
+            // Simple fixed-length types
+            // Let C++ figure out how to convert from, ie., SQLBIGINT to vint.
+        case BoolOID:
+            writer->setBool(vidx.at(i), (*(SQLCHAR*)data.buf == SQL_TRUE ? VTrue : VFalse));
+            break;
+        case Int8OID:
+            if (quirks != Oracle) {
+                writer->setInt(vidx.at(i), *(SQLBIGINT*)data.buf);
+            } else {
+                // Oracle doesn't support int64 as a type.
+                // So we get the data as a string and parse it to an int64.
+                if (data.len == SQL_NTS) { writer->setInt(vidx.at(i), vint_null); }
+                else { writer->setInt(vidx.at(i), (vint)atoll((char*)data.buf)); }
+            }
+            break;
+        case Float8OID:
+            writer->setFloat(vidx.at(i), *(SQLDOUBLE*)data.buf);
+            break;
+        case CharOID: case BinaryOID:
+        case VarcharOID: case VarbinaryOID:
+#ifndef NO_LONG_OIDS
+        case LongVarcharOID: case LongVarbinaryOID:
+#endif
+            if (data.len == SQL_NTS) {
+                data.len = strnlen((char*)data.buf, getFieldSizeForCol(vidx.at(i)));
+            }
+            writer->getStringRef(vidx.at(i)).copy((char*)data.buf, data.len);
+            break;
+
+            // Date/Time functions that work in reasonably direct ways
+        case DateOID: {
+            SQL_DATE_STRUCT &s = *(SQL_DATE_STRUCT*)data.buf;
+            struct tm d = {0,0,0,s.day,s.month-1,s.year-1900,0,0,-1};
+            time_t unixtime = mktime(&d);
+            writer->setDate(vidx.at(i), getDateFromUnixTime(unixtime + d.tm_gmtoff));
+            break;
+        }
+        case TimeOID: {
+            SQL_TIME_STRUCT &s = *(SQL_TIME_STRUCT*)data.buf;
+            writer->setTime(vidx.at(i), getTimeFromHMS(s.hour, s.minute, s.second));
+            break;
+        }
+        case TimestampOID: {
+            SQL_TIMESTAMP_STRUCT &s = *(SQL_TIMESTAMP_STRUCT*)data.buf;
+            struct tm d = {s.second,s.minute,s.hour,s.day,s.month-1,s.year-1900,0,0,-1};
+            time_t unixtime = mktime(&d);
+            // s.fraction is in nanoseconds; Vertica only does microsecond resolution
+            writer->setTimestamp(vidx.at(i), getTimestampFromUnixTime(unixtime + d.tm_gmtoff) + s.fraction/1000);
+            break;
+        }
+
+            // Date/Time functions that require string-parsing
+        case TimeTzOID: {
+            // Hacky workaround:  Some databases (ie., us) send the empty string instead of NULL here
+            if (((char*)data.buf)[0] == '\0') { writer->setNull(vidx.at(i)); break; }
+            TimeADT t = 0;
+            if (!parser.parseTimeTz((char*)data.buf, (size_t)data.len, i, t, getVerticaTypeOfCol(vidx.at(i)), rejectReason)) {
+                vt_report_error(0, "Error parsing TimeTz: '%s' (%s)", (char*)data.buf, rejectReason.c_str());
+            }
+            writer->setTimeTz(vidx.at(i),t);
+            break;
+        }
+
+        case TimestampTzOID: {
+            // Hacky workaround:  Some databases (ie., us) send the empty string instead of NULL here
+            if (((char*)data.buf)[0] == '\0') { writer->setNull(vidx.at(i)); break; }
+            TimestampTz t = 0;
+            if (!parser.parseTimestampTz((char*)data.buf, (size_t)data.len, i, t, getVerticaTypeOfCol(vidx.at(i)), rejectReason)) {
+                vt_report_error(0, "Error parsing TimestampTz: '%s' (%s)", (char*)data.buf, rejectReason.c_str());
+            }
+            writer->setTimestampTz(vidx.at(i),t);
+            break;
+        }
+
+        case IntervalOID: {
+            SQL_INTERVAL_STRUCT &intv = *(SQL_INTERVAL_STRUCT*)data.buf;
+            if (intv.interval_type != SQL_IS_DAY_TO_SECOND) {
+                vt_report_error(0, "Error parsing Interval:  Is type %d; expecting type 10 (SQL_IS_HOUR_TO_SECOND)", (int)intv.interval_type);
+            }
+            // Vertica Intervals are stored as durations in microseconds
+            Interval ret = ((intv.intval.day_second.day*usPerDay)
+                            + (intv.intval.day_second.hour*usPerHour)
+                            + (intv.intval.day_second.minute*usPerMinute)
+                            + (intv.intval.day_second.second*usPerSecond)
+                            + (intv.intval.day_second.fraction/1000)) // Fractions are in nanoseconds; we do microseconds
+                * (intv.interval_sign == SQL_TRUE ? -1 : 1); // Apply the sign bit
+            writer->setInterval(vidx.at(i), ret);
+            break;
+        }
+
+        case IntervalYMOID: {
+            SQL_INTERVAL_STRUCT &intv = *(SQL_INTERVAL_STRUCT*)data.buf;
+            if (intv.interval_type != SQL_IS_YEAR_TO_MONTH) {
+                vt_report_error(0, "Error parsing Interval:  Is type %d; expecting type 7 (SQL_IS_YEAR_TO_MONTH)", (int)intv.interval_type);
+            }
+            // Vertica Intervals are stored as durations in months
+            Interval ret = ((intv.intval.year_month.year*MONTHS_PER_YEAR)
+                            + (intv.intval.year_month.month))
+                * (intv.interval_sign == SQL_TRUE ? -1 : 1); // Apply the sign bit
+            writer->setInterval(vidx.at(i), ret);
+            break;
+        }
+
+            // TODO:  Sort out the binary ODBC Numeric format
+        case NumericOID: {
+            // Hacky workaround:  Some databases may send the empty string instead of NULL here
+            if (((char*)data.buf)[0] == '\0') { writer->setNull(vidx.at(i)); break; }
+            if (!parser.parseNumeric((char*)data.buf, (size_t)data.len, i, writer->getNumericRef(vidx.at(i)), getVerticaTypeOfCol(vidx.at(i)), rejectReason)) {
+                vt_report_error(0, "Error parsing Numeric: '%s' (%s)", (char*)data.buf, rejectReason.c_str());
+            }
+            break;
+        }
+
+        default:
+            vt_report_error(0, "Unrecognized Vertica type %s (OID %llu)",
+                getVerticaTypeOfCol(vidx.at(i)).getTypeStr(),
+                getVerticaTypeOfCol(vidx.at(i)).getTypeOid());
+        } // End SWITCH
+    }
+
+    // Captures a worker's ODBC failure as data for the main thread to re-raise.
+    // No lock: each worker writes only its own slot, read after joinWorkers().
+    void captureWorkerError(int workerIdx, SQLSMALLINT handleType, SQLHANDLE handle,
+                            const char *fnName) {
+        SQLCHAR state_rec[6] = {0};
+        SQLINTEGER native_code = 0;
+        SQLCHAR message_text[MAX_DIAG_MSG_TEXT_LENGTH] = {0};
+        SQLSMALLINT msg_length = 0;
+        SQLGetDiagRec(handleType, handle, 1, &state_rec[0], &native_code,
+                      &message_text[0], MAX_DIAG_MSG_TEXT_LENGTH, &msg_length);
+        WorkerStatus &ws = workerStatus[workerIdx];
+        ws.failed = true;
+        ws.sqlstate = std::string((char*)state_rec);
+        std::ostringstream m;
+        m << fnName << " failed [" << (char*)message_text << "] (native " << (int)native_code << ")";
+        ws.message = m.str();
+    }
+
+    // Worker entry point: owns its own env/dbc/stmt and buffers, and shares only
+    // immutable metadata. Takes no ServerInterface so it cannot touch the writer.
+    void workerRun(int workerIdx, std::string sliceQuery) {
+        SQLHENV wenv = SQL_NULL_HENV;
+        SQLHDBC wdbc = SQL_NULL_HDBC;
+        SQLHSTMT wstmt = SQL_NULL_HSTMT;
+        std::vector<SQLPOINTER> wresp(numcols, (SQLPOINTER)0);
+        std::vector<SQLLEN*> wlenp(numcols, (SQLLEN*)0);
+        SQLULEN wnfrows = 0;
+
+        // Local RAII-ish cleanup: free everything this worker owns on every path.
+        struct Cleanup {
+            SQLHENV *e; SQLHDBC *d; SQLHSTMT *s;
+            std::vector<SQLPOINTER> *rp; std::vector<SQLLEN*> *lp;
+            ~Cleanup() {
+                for (size_t c = 0; rp && c < rp->size(); c++) free((*rp)[c]);
+                for (size_t c = 0; lp && c < lp->size(); c++) free((*lp)[c]);
+                if (s && *s != SQL_NULL_HSTMT) { SQLFreeStmt(*s, SQL_CLOSE); SQLFreeHandle(SQL_HANDLE_STMT, *s); }
+                if (d && *d != SQL_NULL_HDBC) { SQLDisconnect(*d); SQLFreeHandle(SQL_HANDLE_DBC, *d); }
+                if (e && *e != SQL_NULL_HENV) { SQLFreeHandle(SQL_HANDLE_ENV, *e); }
+            }
+        } cleanup = { &wenv, &wdbc, &wstmt, &wresp, &wlenp };
+
+        bool done = false;
+        // unixODBC serializes connections unless the driver sets Threading = 0; see README.
+        if (!SQL_SUCCEEDED(SQLAllocHandle(SQL_HANDLE_ENV, SQL_NULL_HANDLE, &wenv)) ||
+            !SQL_SUCCEEDED(SQLSetEnvAttr(wenv, SQL_ATTR_ODBC_VERSION, (void*)SQL_OV_ODBC3, 0)) ||
+            !SQL_SUCCEEDED(SQLAllocHandle(SQL_HANDLE_DBC, wenv, &wdbc))) {
+            captureWorkerError(workerIdx, SQL_HANDLE_ENV, wenv, "SQLAllocHandle(worker env/dbc)");
+            done = true;
+        }
+        if (!done && !SQL_SUCCEEDED(SQLDriverConnect(wdbc, NULL, (SQLCHAR*)connect.c_str(),
+                                                     SQL_NTS, NULL, 0, NULL, SQL_DRIVER_COMPLETE))) {
+            captureWorkerError(workerIdx, SQL_HANDLE_DBC, wdbc, "SQLDriverConnect(worker)");
+            done = true;
+        }
+        if (!done && !SQL_SUCCEEDED(SQLAllocHandle(SQL_HANDLE_STMT, wdbc, &wstmt))) {
+            captureWorkerError(workerIdx, SQL_HANDLE_DBC, wdbc, "SQLAllocHandle(worker stmt)");
+            done = true;
+        }
+        if (!done) {
+            SQLSetStmtAttr(wstmt, SQL_ATTR_ROW_BIND_TYPE, (SQLPOINTER)SQL_BIND_BY_COLUMN, 0);
+            SQLSetStmtAttr(wstmt, SQL_ATTR_ROW_ARRAY_SIZE, (SQLPOINTER)rowset, 0);
+            SQLSetStmtAttr(wstmt, SQL_ATTR_ROWS_FETCHED_PTR, &wnfrows, 0);
+            if (!SQL_SUCCEEDED(SQLExecDirect(wstmt, (SQLCHAR*)sliceQuery.c_str(), SQL_NTS))) {
+                captureWorkerError(workerIdx, SQL_HANDLE_STMT, wstmt, "SQLExecDirect(worker)");
+                done = true;
+            }
+        }
+        // Same column bindings scheme as the shared single-connection fetch.
+        for (SQLSMALLINT i = 0; !done && i < numcols; i++) {
+            wresp[i] = (SQLPOINTER)malloc((size_t)stype[i] * rowset);
+            wlenp[i] = (SQLLEN*)malloc(sizeof(SQLLEN) * rowset);
+            if (!wresp[i] || !wlenp[i] ||
+                !SQL_SUCCEEDED(SQLBindCol(wstmt, i+1, ctype[i],
+                                          wresp[i], stype[i], wlenp[i]))) {
+                captureWorkerError(workerIdx, SQL_HANDLE_STMT, wstmt, "SQLBindCol(worker)");
+                done = true;
+            }
+        }
+
+        SQLRETURN fetchRet = SQL_SUCCESS;
+        while (!done && !workerStatus[workerIdx].failed) {
+            if (isCanceled()) break;                            // US 5598915: prompt exit on cancel
+            {
+                std::unique_lock<std::mutex> lk(queue.mtx);
+                if (queue.shutdown) break;
+            }
+            fetchRet = SQLFetch(wstmt);
+            if (!SQL_SUCCEEDED(fetchRet)) break;
+
+            Batch batch;
+            batch.rows.reserve((size_t)wnfrows);
+            for (uint32 j = 0; j < (uint32)wnfrows; j++) {
+                std::vector<Cell> row(numcols);
+                for (SQLUSMALLINT i = 0; i < numcols; i++) {
+                    SQLLEN len = wlenp[i][j];
+                    if ((int)len == (int)SQL_NULL_DATA) {
+                        row[i].isNull = true;
+                    } else {
+                        row[i].isNull = false;
+                        // A negative indicator (SQL_NTS/SQL_NO_TOTAL) gives no length, so
+                        // copy the whole field; emitCell() re-measures it on the main thread.
+                        size_t n = (len == SQL_NTS || len < 0) ? (size_t)stype[i] : (size_t)len;
+                        if (n > (size_t)stype[i]) n = (size_t)stype[i];
+                        row[i].bytes.assign((char*)wresp[i] + (size_t)stype[i]*j, n);
+                        row[i].lenIndicator = len;
+                    }
+                }
+                batch.rows.push_back(std::move(row));
+            }
+
+            // Blocks here when the queue is full; this is the backpressure.
+            std::unique_lock<std::mutex> lk(queue.mtx);
+            queue.notFull.wait(lk, [this]{
+                return queue.items.size() < queue.maxItems || queue.shutdown;
+            });
+            if (queue.shutdown) break;                          // woke to exit
+            queue.items.push_back(std::move(batch));
+            queue.notEmpty.notify_one();
+        }
+
+        if (!done && !SQL_SUCCEEDED(fetchRet) && fetchRet != SQL_NO_DATA &&
+            !workerStatus[workerIdx].failed && !isCanceled()) {
+            captureWorkerError(workerIdx, SQL_HANDLE_STMT, wstmt, "SQLFetch(worker)");
+        }
+
+        // Last producer out must wake a consumer that is waiting on an empty queue.
+        {
+            std::unique_lock<std::mutex> lk(queue.mtx);
+            queue.activeProducers--;
+            queue.notEmpty.notify_all();
+            queue.notFull.notify_all();
+        }
+    }
+
+    // Spawns up to min(slices, thread_count, MAX_THREAD) workers exactly once.
+    void startWorkers() {
+        int n = std::min({(int)sliceQueries.size(), threadCountParam, MAX_THREAD});
+        workerStatus.assign(n, WorkerStatus());
+        queue.activeProducers = n;
+        queue.shutdown = false;
+        for (int k = 0; k < n; k++) {
+            try {
+                workers.push_back(std::thread(&ODBCLoader::workerRun, this, k, sliceQueries[k]));
+            } catch (...) {
+                // Discount producers we never started, or activeProducers never
+                // reaches 0 and the consumer waits for a drain that cannot happen.
+                std::unique_lock<std::mutex> lk(queue.mtx);
+                for (int u = k; u < n; u++) {
+                    workerStatus[u].failed = true;
+                    workerStatus[u].message = "worker thread creation failed";
+                }
+                queue.activeProducers -= (n - k);
+                queue.notEmpty.notify_all();
+                break;
+            }
+        }
+    }
+
+    // Joins ALL workers before returning; never detach(). Signals shutdown so a
+    // worker blocked on a full queue wakes and exits (no deadlock).
+    void joinWorkers() {
+        {
+            std::unique_lock<std::mutex> lk(queue.mtx);
+            queue.shutdown = true;
+            queue.notFull.notify_all();
+            queue.notEmpty.notify_all();
+        }
+        for (size_t k = 0; k < workers.size(); k++) {
+            if (workers[k].joinable()) workers[k].join();
+        }
+        workers.clear();
+    }
+
+    // Re-raises the first worker failure on the MAIN thread (US 5602339).
+    void raiseFirstWorkerError(ServerInterface &srvInterface) {
+        for (size_t k = 0; k < workerStatus.size(); k++) {
+            if (workerStatus[k].failed) {
+                vt_report_error(0, "ODBC Loader worker error: %s SQLSTATE=%s",
+                                workerStatus[k].message.c_str(),
+                                workerStatus[k].sqlstate.c_str());
+            }
+        }
+    }
+
+    bool anyWorkerFailed() const {
+        for (size_t k = 0; k < workerStatus.size(); k++) {
+            if (workerStatus[k].failed) return true;
+        }
+        return false;
+    }
+
+
 public:
 
     virtual StreamState process(ServerInterface &srvInterface, DataBuffer &input, InputState input_state) {
+        // Threaded path: the main thread is the sole consumer. Emit a bounded number
+        // of batches per call so the KEEP_GOING re-entry contract still holds.
+        if (threaded) {
+            if (!workersStarted) {
+                startWorkers();
+                workersStarted = true;
+            }
+
+            uint32 batches_emitted = 0;
+            while (batches_emitted < BATCHES_PER_BREAK) {
+                Batch batch;
+                bool haveBatch = false;
+                {
+                    std::unique_lock<std::mutex> lk(queue.mtx);
+                    queue.notEmpty.wait(lk, [this]{
+                        return !queue.items.empty() || queue.activeProducers == 0 || queue.shutdown;
+                    });
+                    if (!queue.items.empty()) {
+                        batch = std::move(queue.items.front());
+                        queue.items.pop_front();
+                        queue.notFull.notify_one();
+                        haveBatch = true;
+                    }
+                }
+
+                if (haveBatch) {
+                    for (size_t r = 0; r < batch.rows.size(); r++) {
+                        std::vector<Cell> &row = batch.rows[r];
+                        for (SQLUSMALLINT i = 0; i < colInTable; i++)
+                            writer->setNull(i);                 // set all cols to NULL
+                        for (SQLUSMALLINT i = 0; i < numcols; i++) {
+                            if (row[i].isNull) continue;
+                            emitCell(srvInterface, i, (SQLPOINTER)row[i].bytes.data(), row[i].lenIndicator);
+                        }
+                        writer->next();
+                    }
+                    batches_emitted++;
+                    continue;
+                }
+
+                // Nothing queued: producers are finished, or we were asked to stop.
+                break;
+            }
+
+            // Cancellation check while draining (US 5598915).
+            if (isCanceled()) {
+                joinWorkers();
+                return DONE;
+            }
+
+            // Not done until ALL producers finished AND the queue is fully drained.
+            bool drainedAndDone;
+            {
+                std::unique_lock<std::mutex> lk(queue.mtx);
+                drainedAndDone = (queue.activeProducers == 0 && queue.items.empty());
+            }
+            if (!drainedAndDone) {
+                return KEEP_GOING;
+            }
+
+            // All workers finished and queue drained: join before returning.
+            joinWorkers();
+            if (anyWorkerFailed()) {
+                // Rows already emitted stay uncommitted: vt_report_error aborts the
+                // COPY and Vertica rolls the transaction back.
+                raiseFirstWorkerError(srvInterface);
+            }
+            return DONE;
+        }
+
+        // ---- Single-slice path (unchanged) ----
         // Every so many iterations we want to
         // break out and check for Vertica cancel messages
         uint32 iter_counter = 0;
@@ -623,8 +1069,8 @@ public:
             quirks = Oracle;
         }
 
-        // MOD() is engine-dependent; range is the portable default. Mark MOD()
-        // supported only for known engines (Postgres, Oracle, MySQL).
+        // MOD() is engine-dependent (SQL Server/Sybase use %); allow-list known engines.
+        // MariaDB reports its own DBMS name but shares MySQL's MOD() sign semantics.
         char dbms[64];
         memset(&dbms[0], 0, sizeof(dbms));
         SQLGetInfo(dbc, SQL_DBMS_NAME, dbms, sizeof(dbms) - 1, NULL);
@@ -635,7 +1081,8 @@ public:
         }
         modSupported = (dbms_name.find("postgres") != std::string::npos ||
                         dbms_name.find("oracle")   != std::string::npos ||
-                        dbms_name.find("mysql")    != std::string::npos);
+                        dbms_name.find("mysql")    != std::string::npos ||
+                        dbms_name.find("mariadb")  != std::string::npos);
     }
 
     virtual void setup(ServerInterface &srvInterface, SizedColumnTypes &returnType) {
@@ -644,7 +1091,8 @@ public:
 		bool src_rfilter = true ;       // Rows filtering flag
         bool src_cfilter = true ;       // Column filtering flag
         bool oq_flag = false ;          // Query Ovverride flag
-        std::string connect = "" ;      // Connect string
+        // 'connect' is a member so workers can open their own connections.
+        connect = "" ;                  // Connect string
         std::string query = "" ;        // Remote system query string
         std::string predicates = "" ;   // Predicates
 
@@ -692,6 +1140,7 @@ public:
             if ( thread_count < MIN_THREAD || thread_count > MAX_THREAD )
                 vt_report_error(0, "Error:  Invalid thread_count=%zd. Permitted values between %d and %d", thread_count, MIN_THREAD, MAX_THREAD);
         }
+        threadCountParam = (int)thread_count ;   // caps the worker count in startWorkers()
 
         // Check "split_column" (bare identifier) and "split_method" ("range"/"modulo").
         std::string split_column = "" ;
@@ -835,6 +1284,9 @@ srvInterface.log("-----> External Table Columns, colInTable=<%d>", colInTable);
 
         // Derive the split and run the first/only slice; unsplit path is unchanged.
         buildSliceQueries(srvInterface, query, (int)thread_count, split_column, split_method);
+        // Slice 0 also runs below on the shared connection to derive column metadata,
+        // so worker 0 re-runs it; harmless for a SELECT, but it is one extra execution.
+        threaded = (sliceQueries.size() > 1);
         r = SQLExecDirect(stmt, (SQLCHAR*)sliceQueries[currentSlice].c_str(), SQL_NTS);
         handleReturnCode(srvInterface, r, SQL_HANDLE_STMT, stmt, "SQLExecDirect()");
 
@@ -848,6 +1300,7 @@ srvInterface.log("-----> External Table Columns, colInTable=<%d>", colInTable);
         // Allocate space for Vertica data types OID and size
         vtype = (BaseDataOID *)srvInterface.allocator->alloc(numcols * sizeof(BaseDataOID)) ;
         stype = (uint32 *)srvInterface.allocator->alloc(numcols * sizeof(uint32)) ;
+        ctype = (SQLSMALLINT *)srvInterface.allocator->alloc(numcols * sizeof(SQLSMALLINT)) ;
 
         // Plain COPY leaves vidx empty. Default to identity mapping and set
         // colInTable so the pre-null loop covers all columns.
@@ -863,18 +1316,28 @@ srvInterface.log("-----> External Table Columns, colInTable=<%d>", colInTable);
         for (SQLSMALLINT i = 0; i < numcols; i++) {
             vtype[i] = getVerticaTypeOfCol(vidx.at(i)).getTypeOid();
             stype[i] = getFieldSizeForCol(vidx.at(i)) ;
+            ctype[i] = getCTypeOfCol(vidx.at(i)) ;
 #if LOADER_DEBUG
   srvInterface.log("DEBUG i=%d rowset=%zu stype[i]=%d", i, rowset, stype[i]);
 #endif
             resp[i] = (SQLPOINTER)srvInterface.allocator->alloc(stype[i] * rowset);
             lenp[i] = (SQLLEN *)srvInterface.allocator->alloc(sizeof(SQLLEN) * rowset);
 
-            r = SQLBindCol(stmt, i+1, getCTypeOfCol(vidx.at(i)), resp[i], stype[i], lenp[i]);
+            r = SQLBindCol(stmt, i+1, ctype[i], resp[i], stype[i], lenp[i]);
             handleReturnCode(srvInterface, r, SQL_HANDLE_STMT, stmt, "SQLBindCol()");
+        }
+
+        // Workers fetch on their own connections, so the shared cursor is only
+        // needed for the metadata derived above.
+        if (threaded) {
+            SQLFreeStmt(stmt, SQL_CLOSE);
         }
     }
 
     virtual void destroy(ServerInterface &srvInterface, SizedColumnTypes &returnType) {
+        // Join before freeing handles; a joinable thread left at destruction terminates.
+        joinWorkers();
+
         // Fix for Issue #1. Commit before calling SQLDisconnect to avoid HY010 error.
         SQLRETURN r_end_tran = SQLEndTran(SQL_HANDLE_DBC, dbc, SQL_COMMIT);
         handleReturnCode(srvInterface, r_end_tran, SQL_HANDLE_DBC, dbc, "SQLEndTran()");
