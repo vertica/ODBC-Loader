@@ -1,5 +1,4 @@
 Timing is off.
-SET
 CREATE TABLE
  Rows Loaded 
 -------------
@@ -158,6 +157,12 @@ CREATE TABLE
  102 | Bob
  103 | Charlie
 (3 rows)
+
+vsql: ERROR: ODBC Loader worker error: SQLExecDirect(worker) failed [[MySQL][...][...]Invalid GIS data provided to function st_geomfromtext.] (native 3037) SQLSTATE=HY000
+ nrows 
+-------
+     0
+(1 row)
 
 DROP TABLE
 DROP TABLE

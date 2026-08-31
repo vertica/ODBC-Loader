@@ -1,13 +1,12 @@
 \timing off
 
--- Set output to a fixed timezone regardless of where this is being tested
-set time zone to 'EST';
-
 -- Multi-threaded fetch: thread_count / split_column / split_method.
 -- Slice order is not deterministic, so every check below is an order-independent
 -- aggregate over testdb.test_source (9 data rows plus 1 all-NULL row). A dropped
 -- row, a duplicated row, or a NULL key claimed by two slices moves at least one
 -- of the four totals.
+-- These totals track the shared testdb.test_source fixture created by
+-- .github/workflows/ci.yml; editing that fixture means updating this test too.
 
 -- Target table reused (and truncated) by every load below
 CREATE TABLE mt_target (i integer, v varchar(32));
@@ -105,6 +104,15 @@ CREATE EXTERNAL TABLE public.mt_people (
 );
 
 SELECT id, name FROM public.mt_people ORDER BY id;
+
+-- Test 16: a worker that connects and then dies part way through its slice. The
+-- geometry conversion is only evaluated for i > 6, so slice 0 (which setup() also
+-- runs to derive column metadata) and slice 1 succeed while the last slice fails
+-- on the remote side. This proves the runtime path no other test reaches:
+-- captureWorkerError -> re-raise on the main thread -> Vertica rolls the COPY
+-- back, so none of the rows the healthy workers already emitted are committed.
+COPY mt_target WITH SOURCE ODBCSource() PARSER ODBCLoader(connect='DSN=MySQL', query='SELECT i, ST_ASTEXT(ST_GEOMFROMTEXT(CASE WHEN i > 6 THEN ''oops'' ELSE ''POINT(1 1)'' END)) AS v FROM testdb.test_source;', thread_count=3, split_column='i');
+SELECT count(*) AS nrows FROM mt_target;
 
 -- Clean up
 DROP TABLE public.mt_people;

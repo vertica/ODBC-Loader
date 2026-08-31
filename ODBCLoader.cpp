@@ -18,6 +18,7 @@
 #include <condition_variable>
 #include <deque>
 #include <algorithm>
+#include <atomic>
 
 // To deal with TimeTz and TimestampTz.
 // No standard native-SQL representation for these,
@@ -63,7 +64,8 @@ static inline TimeADT getTimeFromHMS(uint32 hour, uint8 min, uint8 sec) {
 class ODBCLoader : public UDParser {
 public:
     ODBCLoader() : currentSlice(0), quirks(NoQuirks), modSupported(false),
-                   threaded(false), workersStarted(false), threadCountParam(DEF_THREAD) {}
+                   threaded(false), workersStarted(false), threadCountParam(DEF_THREAD),
+                   canceledFlag(false) {}
 
     // Maximum length of diagnostic-message text
     // that we can receive from the ODBC driver.
@@ -142,7 +144,7 @@ private:
     // One column of one row, as raw driver bytes the main thread converts later.
     struct Cell {
         bool isNull;
-        SQLLEN lenIndicator;  // original driver length indicator (may be SQL_NTS)
+        SQLLEN lenIndicator;  // driver length indicator; any negative value stored as SQL_NTS
         std::string bytes;
         Cell() : isNull(true), lenIndicator(0) {}
     };
@@ -177,6 +179,9 @@ private:
     bool threaded;          // true when running the multi-worker path
     bool workersStarted;    // spawn workers only once across process() re-entry
     int threadCountParam;   // validated thread_count; hard ceiling on workers
+
+    // Published by the main thread; workers must not call the SDK's isCanceled().
+    std::atomic<bool> canceledFlag;
 
     // Gets the Vertica type of the specified column
     VerticaType getVerticaTypeOfCol(SQLSMALLINT colnum) {
@@ -468,8 +473,8 @@ private:
         handleReturnCode(srvInterface, r, SQL_HANDLE_STMT, stmt, "SQLExecDirect()");
     }
 
-    // Converts one already-fetched cell (raw driver bytes) into the writer; main
-    // thread only. NOTE: the single-slice loop in process() still has its own copy.
+    // The single conversion routine, shared by the threaded and single-slice paths.
+    // Main thread only: it is the only thread allowed to touch the writer.
     void emitCell(ServerInterface &srvInterface, SQLUSMALLINT i, SQLPOINTER buf, SQLLEN len) {
         Buf data;
         data.buf = buf;
@@ -501,7 +506,9 @@ private:
 #ifndef NO_LONG_OIDS
         case LongVarcharOID: case LongVarbinaryOID:
 #endif
-            if (data.len == SQL_NTS) {
+            // Any negative length means the driver gave us none (SQL_NTS/SQL_NO_TOTAL);
+            // testing the sign also fixes a latent bug in the single-connection path.
+            if (data.len < 0) {
                 data.len = strnlen((char*)data.buf, getFieldSizeForCol(vidx.at(i)));
             }
             writer->getStringRef(vidx.at(i)).copy((char*)data.buf, data.len);
@@ -679,7 +686,7 @@ private:
 
         SQLRETURN fetchRet = SQL_SUCCESS;
         while (!done && !workerStatus[workerIdx].failed) {
-            if (isCanceled()) break;                            // US 5598915: prompt exit on cancel
+            if (canceledFlag.load()) break;                     // US 5598915: prompt exit on cancel
             {
                 std::unique_lock<std::mutex> lk(queue.mtx);
                 if (queue.shutdown) break;
@@ -699,10 +706,11 @@ private:
                         row[i].isNull = false;
                         // A negative indicator (SQL_NTS/SQL_NO_TOTAL) gives no length, so
                         // copy the whole field; emitCell() re-measures it on the main thread.
-                        size_t n = (len == SQL_NTS || len < 0) ? (size_t)stype[i] : (size_t)len;
+                        size_t n = (len < 0) ? (size_t)stype[i] : (size_t)len;
                         if (n > (size_t)stype[i]) n = (size_t)stype[i];
                         row[i].bytes.assign((char*)wresp[i] + (size_t)stype[i]*j, n);
-                        row[i].lenIndicator = len;
+                        // Any negative indicator is normalised to SQL_NTS so the consumer re-measures.
+                        row[i].lenIndicator = (len < 0) ? SQL_NTS : len;
                     }
                 }
                 batch.rows.push_back(std::move(row));
@@ -719,13 +727,15 @@ private:
         }
 
         if (!done && !SQL_SUCCEEDED(fetchRet) && fetchRet != SQL_NO_DATA &&
-            !workerStatus[workerIdx].failed && !isCanceled()) {
+            !workerStatus[workerIdx].failed && !canceledFlag.load()) {
             captureWorkerError(workerIdx, SQL_HANDLE_STMT, wstmt, "SQLFetch(worker)");
         }
 
         // Last producer out must wake a consumer that is waiting on an empty queue.
         {
             std::unique_lock<std::mutex> lk(queue.mtx);
+            // This worker failed, so the load is doomed: stop the others and the consumer now.
+            if (workerStatus[workerIdx].failed) queue.shutdown = true;
             queue.activeProducers--;
             queue.notEmpty.notify_all();
             queue.notFull.notify_all();
@@ -756,23 +766,26 @@ private:
         }
     }
 
+    // Wakes every blocked worker and the consumer so they can observe the exit condition.
+    void requestShutdown() {
+        std::unique_lock<std::mutex> lk(queue.mtx);
+        queue.shutdown = true;
+        queue.notFull.notify_all();
+        queue.notEmpty.notify_all();
+    }
+
     // Joins ALL workers before returning; never detach(). Signals shutdown so a
     // worker blocked on a full queue wakes and exits (no deadlock).
     void joinWorkers() {
-        {
-            std::unique_lock<std::mutex> lk(queue.mtx);
-            queue.shutdown = true;
-            queue.notFull.notify_all();
-            queue.notEmpty.notify_all();
-        }
+        requestShutdown();
         for (size_t k = 0; k < workers.size(); k++) {
             if (workers[k].joinable()) workers[k].join();
         }
         workers.clear();
     }
 
-    // Re-raises the first worker failure on the MAIN thread (US 5602339).
-    void raiseFirstWorkerError(ServerInterface &srvInterface) {
+    // Re-raises the lowest-indexed worker failure on the MAIN thread (US 5602339).
+    void raiseWorkerError(ServerInterface &srvInterface) {
         for (size_t k = 0; k < workerStatus.size(); k++) {
             if (workerStatus[k].failed) {
                 vt_report_error(0, "ODBC Loader worker error: %s SQLSTATE=%s",
@@ -799,6 +812,12 @@ public:
             if (!workersStarted) {
                 startWorkers();
                 workersStarted = true;
+            }
+
+            // Workers cannot call isCanceled(), so publish it for them here.
+            if (isCanceled()) {
+                canceledFlag.store(true);
+                requestShutdown();          // wake a worker blocked on a full queue
             }
 
             uint32 batches_emitted = 0;
@@ -839,6 +858,7 @@ public:
 
             // Cancellation check while draining (US 5598915).
             if (isCanceled()) {
+                canceledFlag.store(true);
                 joinWorkers();
                 return DONE;
             }
@@ -858,7 +878,7 @@ public:
             if (anyWorkerFailed()) {
                 // Rows already emitted stay uncommitted: vt_report_error aborts the
                 // COPY and Vertica rolls the transaction back.
-                raiseFirstWorkerError(srvInterface);
+                raiseWorkerError(srvInterface);
             }
             return DONE;
         }
@@ -881,151 +901,13 @@ public:
   srvInterface.log("DEBUG nfrows=%u j=%u i=%d lenp[%d][%d]=%ld", (uint32)nfrows, j, i, i, j, lenp[i][j]);
 #endif
 
-                // MF allocate & set Buf struct so we can re-use the original code in the Fetch loop...
-                Buf data ;
-
                 // MF SQLPOINTER is a (void *) so it would generate an arithmetic warning if not casted
-                data.buf = (SQLPOINTER)( (uint8_t *)resp[i] + stype[i] * j ) ;
-                data.len = lenp[i][j] ;
+                SQLPOINTER buf = (SQLPOINTER)( (uint8_t *)resp[i] + stype[i] * j ) ;
+                SQLLEN len = lenp[i][j] ;
 
-                std::string rejectReason = "unrecognized syntax from remote database";
-                
-                if ((int)data.len != (int)SQL_NULL_DATA ) {     // (re)write NOT NULL cols
-                    switch (vtype[i]) {
-                        
-                        // Simple fixed-length types
-                        // Let C++ figure out how to convert from, ie., SQLBIGINT to vint.
-                        // (Both are native C++ types with appropriate meanings, so hopefully this will DTRT.)
-                        // (In most implementations they are probably the same type so this is a no-op.)
-                    case BoolOID:
-                        writer->setBool(vidx.at(i), (*(SQLCHAR*)data.buf == SQL_TRUE ? VTrue : VFalse));
-                        break;
-                    case Int8OID:
-                        if (quirks != Oracle) {
-                            writer->setInt(vidx.at(i), *(SQLBIGINT*)data.buf);
-                        } else {
-                            // Oracle doesn't support int64 as a type.
-                            // So we get the data as a string and parse it to an int64.
-                            if (data.len == SQL_NTS) { writer->setInt(vidx.at(i), vint_null); }
-                            else { writer->setInt(vidx.at(i), (vint)atoll((char*)data.buf)); }
-                        } 
-                        break;
-                    case Float8OID:
-                        writer->setFloat(vidx.at(i), *(SQLDOUBLE*)data.buf); 
-                        break;
-                    case CharOID: case BinaryOID:
-                    case VarcharOID: case VarbinaryOID:
-#ifndef NO_LONG_OIDS
-                    case LongVarcharOID: case LongVarbinaryOID:
-#endif
-                        if (data.len == SQL_NTS) { 
-                            data.len = strnlen((char*)data.buf, getFieldSizeForCol(vidx.at(i))); 
-                        }
-                        writer->getStringRef(vidx.at(i)).copy((char*)data.buf, data.len);
-                        break;
-
-                        // Date/Time functions that work in reasonably direct ways
-                    case DateOID: {
-                        SQL_DATE_STRUCT &s = *(SQL_DATE_STRUCT*)data.buf;
-                        struct tm d = {0,0,0,s.day,s.month-1,s.year-1900,0,0,-1};
-                        time_t unixtime = mktime(&d);
-                        writer->setDate(vidx.at(i), getDateFromUnixTime(unixtime + d.tm_gmtoff));
-                        break;
-                    }
-                    case TimeOID: {
-                        SQL_TIME_STRUCT &s = *(SQL_TIME_STRUCT*)data.buf;
-                        writer->setTime(vidx.at(i), getTimeFromHMS(s.hour, s.minute, s.second));
-                        break;
-                    }
-                    case TimestampOID: {
-                        SQL_TIMESTAMP_STRUCT &s = *(SQL_TIMESTAMP_STRUCT*)data.buf;
-                        struct tm d = {s.second,s.minute,s.hour,s.day,s.month-1,s.year-1900,0,0,-1};
-                        time_t unixtime = mktime(&d);
-                        // s.fraction is in nanoseconds; Vertica only does microsecond resolution
-                        // setTimestamp() wants time since epoch localtime.
-                        writer->setTimestamp(vidx.at(i), getTimestampFromUnixTime(unixtime + d.tm_gmtoff) + s.fraction/1000);
-                        break;
-                    }
-                        
-                        // Date/Time functions that require string-parsing
-                    case TimeTzOID: {
-                        // Hacky workaround:  Some databases (ie., us) send the empty string instead of NULL here
-                        if (((char*)data.buf)[0] == '\0') { writer->setNull(vidx.at(i)); break; }
-                        TimeADT t = 0;
-                        
-                        if (!parser.parseTimeTz((char*)data.buf, (size_t)data.len, i, t, getVerticaTypeOfCol(vidx.at(i)), rejectReason)) {
-                            vt_report_error(0, "Error parsing TimeTz: '%s' (%s)", (char*)data.buf, rejectReason.c_str());  // No rejected-rows for us!  Die on failure.
-                        }
-                        writer->setTimeTz(vidx.at(i),t);
-                        break;
-                    }
-                        
-                    case TimestampTzOID: {
-                        // Hacky workaround:  Some databases (ie., us) send the empty string instead of NULL here
-                        if (((char*)data.buf)[0] == '\0') { writer->setNull(vidx.at(i)); break; }
-                        TimestampTz t = 0;
-                        if (!parser.parseTimestampTz((char*)data.buf, (size_t)data.len, i, t, getVerticaTypeOfCol(vidx.at(i)), rejectReason)) {
-                            vt_report_error(0, "Error parsing TimestampTz: '%s' (%s)", (char*)data.buf, rejectReason.c_str());  // No rejected-rows for us!  Die on failure.
-                        }
-                        writer->setTimestampTz(vidx.at(i),t);
-                        break;
-                    }
-                        
-                    case IntervalOID: {
-                        SQL_INTERVAL_STRUCT &intv = *(SQL_INTERVAL_STRUCT*)data.buf;
-                        
-                        // Make sure we know what we're talking about
-                        if (intv.interval_type != SQL_IS_DAY_TO_SECOND) {
-                            vt_report_error(0, "Error parsing Interval:  Is type %d; expecting type 10 (SQL_IS_HOUR_TO_SECOND)", (int)intv.interval_type);
-                        }
-
-                        // Vertica Intervals are stored as durations in microseconds
-                        Interval ret = ((intv.intval.day_second.day*usPerDay)
-                                        + (intv.intval.day_second.hour*usPerHour)
-                                        + (intv.intval.day_second.minute*usPerMinute)
-                                        + (intv.intval.day_second.second*usPerSecond)
-                                        + (intv.intval.day_second.fraction/1000)) // Fractions are in nanoseconds; we do microseconds
-                            * (intv.interval_sign == SQL_TRUE ? -1 : 1); // Apply the sign bit
-                        
-                        writer->setInterval(vidx.at(i), ret);
-                        break;   
-                    }
-
-                    case IntervalYMOID: {
-                        SQL_INTERVAL_STRUCT &intv = *(SQL_INTERVAL_STRUCT*)data.buf;
-                        
-                        // Make sure we know what we're talking about
-                        if (intv.interval_type != SQL_IS_YEAR_TO_MONTH) {
-                            vt_report_error(0, "Error parsing Interval:  Is type %d; expecting type 7 (SQL_IS_YEAR_TO_MONTH)", (int)intv.interval_type);
-                        }
-
-                        // Vertica Intervals are stored as durations in months
-                        Interval ret = ((intv.intval.year_month.year*MONTHS_PER_YEAR)
-                                        + (intv.intval.year_month.month))
-                            * (intv.interval_sign == SQL_TRUE ? -1 : 1); // Apply the sign bit
-                        
-                        writer->setInterval(vidx.at(i), ret);
-                        break;   
-                    }
-                        
-                        // TODO:  Sort out the binary ODBC Numeric format
-                        // and the abilities of various DB's to cast to/from it on demand;
-                        // make this use the native binary format and cast/convert as needed.
-                    case NumericOID: {
-                        // Hacky workaround:  Some databases may send the empty string instead of NULL here
-                        if (((char*)data.buf)[0] == '\0') { writer->setNull(vidx.at(i)); break; }
-                        if (!parser.parseNumeric((char*)data.buf, (size_t)data.len, i, writer->getNumericRef(vidx.at(i)), getVerticaTypeOfCol(vidx.at(i)), rejectReason)) {
-                            vt_report_error(0, "Error parsing Numeric: '%s' (%s)", (char*)data.buf, rejectReason.c_str());  // No rejected-rows for us!  Die on failure.
-                        }
-                        break;
-                    }
-
-                    default:
-                        vt_report_error(0, "Unrecognized Vertica type %s (OID %llu)",
-                            getVerticaTypeOfCol(vidx.at(i)).getTypeStr(), 
-                            getVerticaTypeOfCol(vidx.at(i)).getTypeOid());
-                } // End SWITCH
-              }   // End IF NOT NULL
+                if ((int)len != (int)SQL_NULL_DATA ) {     // (re)write NOT NULL cols
+                    emitCell(srvInterface, i, buf, len);
+                }
             }     // End FOR EACH COLUMN
 
             writer->next();	// avanzamento alla riga successiva (scrive e avanza il cursor)
