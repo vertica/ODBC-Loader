@@ -41,11 +41,14 @@ COPY myschema.myverticatable
     WITH SOURCE ODBCSource() PARSER ODBCLoader(
         connect='DSN=some_odbc_dsn;<other connection parameters>',  
         query='select * from remote_table',
-        [rowset=<number>]
+        [rowset=<number>],
+        [thread_count=<number>], [split_column='<column>'], [split_method='range'|'modulo']
     )
 ;
 ```
 where ``rowset`` is an optional parameter to define the number of rows fetched from the remote database in each SQLFetch() call (default = 100). Increasing this parameter can improve the performance but will also increase memory usage.
+
+``thread_count``, ``split_column`` and ``split_method`` are optional parameters that enable parallel fetch; see [Parallel fetch](#parallel-fetch) below.
 
 This will cause Vertica to connect to the remote database identified by the given "connect" string and execute the given query.  It will then fetch the results of the query and load them into the table ``myschema.myverticatable``.
 
@@ -111,6 +114,41 @@ CREATE  EXTERNAL  TABLE  public.epeople(
 ) ;
 ```
 Please consider that increasing this parameter will also increase the memory consumption of the ODBCLoader.
+
+### Parallel fetch
+By default the ODBCLoader opens one connection to the remote database and fetches the result set serially. If the remote query has an **integer** column with a reasonably even spread, you can split it into slices and fetch them concurrently, each slice on its own ODBC connection:
+
+| Parameter 		| Default 	| Meaning 	|
+| --- 			| --- 		| --- 		|
+| ``thread_count`` 	| 1 		| Number of slices/worker threads, 1..64. 1 keeps the original single-connection behaviour. |
+| ``split_column`` 	| *(none)* 	| Bare (unquoted) name of the integer column to split on. Required; without it ``thread_count`` is ignored. |
+| ``split_method`` 	| ``range`` 	| ``range`` splits the ``MIN``/``MAX`` span into contiguous ``BETWEEN`` chunks. ``modulo`` uses ``MOD()``, which spreads skewed keys more evenly but is only used on engines known to support ``MOD()`` (PostgreSQL, Oracle, MySQL, MariaDB); elsewhere it degrades to ``range``. |
+
+```sql
+CREATE  EXTERNAL  TABLE  public.epeople(
+    id INTEGER,
+    name VARCHAR(20)
+) AS  COPY  WITH
+    SOURCE  ODBCSource()
+    PARSER  ODBCLoader(
+        connect='DSN=pmf',
+        query='SELECT * FROM public.people',
+        thread_count = 4,
+        split_column = 'id'
+) ;
+```
+
+The loader falls back to a single connection - without failing the load - when ``split_column`` is missing, is not a bare identifier, is not integer-valued, or has been pruned out of the remote query. The reason is written to the UDx log. Rows are **not** returned in a deterministic order when more than one slice is used. A slice query may also be executed more than once (the first slice runs once on the coordinating connection to derive column metadata, then again on its worker), so the remote query should be free of side effects.
+
+**Memory.** Each worker binds its own ``rowset``-sized fetch buffers and a small fixed number of converted batches (currently 8) may be queued, so the buffered memory is roughly ``thread_count x rowset x row_width``. ``thread_count`` multiplies the cost of ``rowset``: raising both at once is the easy way to exceed ``FencedUDxMemoryLimitMB``.
+
+**unixODBC.** Parallel fetch only delivers a speed-up if the driver manager is allowed to run driver calls concurrently. unixODBC serialises them unless the driver's section in ``odbcinst.ini`` sets ``Threading = 0``:
+```
+[MYODBC]
+Driver=/usr/lib64/libmyodbc8w.so
+Threading = 0
+```
+Without it the workers still produce correct results, just no concurrency. Make sure the driver is a thread-safe build first (see the MYSQL note under [Database Specific Notes](#database-specific-notes)).
 
 You can **switch predicate pushdown on/off** with the optional boolean parameter  ``src_rfilter``. The default value is true (meaning we perform predicate pushdown). You can set  ``src_rfilter``  either in the ``CREATE EXTERNAL TABLE`` statement or using a **SESSION PARAMETER** as follows:
 ```sql

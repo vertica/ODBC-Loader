@@ -1,0 +1,168 @@
+Timing is off.
+CREATE TABLE
+ Rows Loaded 
+-------------
+          10
+(1 row)
+
+ nrows | nn_i | sum_i | len_v 
+-------+------+-------+-------
+    10 |    9 |    45 |    54
+(1 row)
+
+TRUNCATE TABLE
+ Rows Loaded 
+-------------
+          10
+(1 row)
+
+ nrows | nn_i | sum_i | len_v 
+-------+------+-------+-------
+    10 |    9 |    45 |    54
+(1 row)
+
+TRUNCATE TABLE
+ Rows Loaded 
+-------------
+          10
+(1 row)
+
+ nrows | nn_i | sum_i | len_v 
+-------+------+-------+-------
+    10 |    9 |    45 |    54
+(1 row)
+
+TRUNCATE TABLE
+ Rows Loaded 
+-------------
+          10
+(1 row)
+
+ nrows | nn_i | sum_i | len_v 
+-------+------+-------+-------
+    10 |    9 |    45 |    54
+(1 row)
+
+TRUNCATE TABLE
+ Rows Loaded 
+-------------
+          10
+(1 row)
+
+ nrows | nn_i | sum_i | len_v 
+-------+------+-------+-------
+    10 |    9 |    45 |    54
+(1 row)
+
+TRUNCATE TABLE
+ Rows Loaded 
+-------------
+          10
+(1 row)
+
+ nrows | nn_i | sum_i | len_v 
+-------+------+-------+-------
+    10 |    9 |    45 |    54
+(1 row)
+
+TRUNCATE TABLE
+ Rows Loaded 
+-------------
+          10
+(1 row)
+
+ nrows | nn_i | sum_i | len_v 
+-------+------+-------+-------
+    10 |    9 |    45 |    54
+(1 row)
+
+TRUNCATE TABLE
+ Rows Loaded 
+-------------
+          10
+(1 row)
+
+ nrows | nn_i | sum_i | len_v 
+-------+------+-------+-------
+    10 |    9 |    45 |    54
+(1 row)
+
+TRUNCATE TABLE
+ Rows Loaded 
+-------------
+          10
+(1 row)
+
+ nrows | nn_i | sum_i | len_v 
+-------+------+-------+-------
+    10 |    9 |    45 |    54
+(1 row)
+
+TRUNCATE TABLE
+ Rows Loaded 
+-------------
+          10
+(1 row)
+
+ nrows | nn_i | sum_i | len_v 
+-------+------+-------+-------
+    10 |    9 |    45 |    54
+(1 row)
+
+TRUNCATE TABLE
+ Rows Loaded 
+-------------
+          10
+(1 row)
+
+ nrows | nn_i | sum_i | len_v 
+-------+------+-------+-------
+    10 |    9 |   -18 |    54
+(1 row)
+
+TRUNCATE TABLE
+ Rows Loaded 
+-------------
+          10
+(1 row)
+
+ nrows | nn_i | sum_i | len_v 
+-------+------+-------+-------
+    10 |    9 |   -18 |    54
+(1 row)
+
+TRUNCATE TABLE
+ Rows Loaded 
+-------------
+          10
+(1 row)
+
+ nrows | nn_i | sum_i | len_v 
+-------+------+-------+-------
+    10 |    9 |   -18 |    54
+(1 row)
+
+TRUNCATE TABLE
+vsql: ERROR: Error:  Invalid thread_count=0. Permitted values between 1 and 64
+vsql: ERROR: Error:  Invalid thread_count=65. Permitted values between 1 and 64
+ nrows 
+-------
+     0
+(1 row)
+
+CREATE TABLE
+ id  |  name   
+-----+---------
+ 101 | Alice
+ 102 | Bob
+ 103 | Charlie
+(3 rows)
+
+vsql: ERROR: ODBC Loader worker error: SQLExecDirect(worker) failed [[MySQL][...][...]Invalid GIS data provided to function st_geomfromtext.] (native 3037) SQLSTATE=HY000
+ nrows 
+-------
+     0
+(1 row)
+
+DROP TABLE
+DROP TABLE

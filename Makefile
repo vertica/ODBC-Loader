@@ -77,6 +77,23 @@ test:
 		      s/(Error parsing .* )\(.*\)$$/$$1(...)/; \
 		      s/mariadb/MySQL/ig; ' $(TMPDIR)/federated_queries.out) && echo "[✓] Test validation passed" || (echo "[✗] Test validation failed" && exit 1)
 	@echo ""
+	@echo "[*] Running Multi-threaded Fetch Test..."
+	@echo ""
+	@$(VSQL) -f tests/multithread_test.sql 2>&1 | tee $(TMPDIR)/multithread_test.out | perl -pe 's/^vsql:[\/_:\w\.]* /vsql: /; \
+	              s/\[ODBC[^\]]*\]/[...]/g; \
+		      s/\[mysql[^\]]*\]/[...]/g; \
+		      s/(Error parsing .* )\(.*\)$$/$$1(...)/; \
+		      s/^vsql: ERROR \d+:.*message: /vsql: ERROR: /; \
+		      s/mariadb/MySQL/ig; '
+	@echo ""
+	@echo "[*] Validating multi-threaded fetch test output..."
+	@diff -u tests/expected/multithread_test.out <(perl -pe 's/^vsql:[\/_:\w\.]* /vsql: /; \
+	              s/\[ODBC[^\]]*\]/[...]/g; \
+		      s/\[mysql[^\]]*\]/[...]/g; \
+		      s/(Error parsing .* )\(.*\)$$/$$1(...)/; \
+		      s/^vsql: ERROR \d+:.*message: /vsql: ERROR: /; \
+		      s/mariadb/MySQL/ig; ' $(TMPDIR)/multithread_test.out) && echo "[✓] Multi-threaded fetch test validation passed" || (echo "[✗] Multi-threaded fetch test validation failed" && exit 1)
+	@echo ""
 	@echo "========================================="
 	@echo "✓ ALL TESTS SUCCESSFUL"
 	@echo "========================================="
