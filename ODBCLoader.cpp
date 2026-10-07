@@ -53,17 +53,13 @@
 
 using namespace Vertica;
 
-// ii declare global variable colInTable (# columns in source table, vidx (array conataining index of column in SELECT)
-int colInTable = 0;
-std::vector<int> vidx;
-//
 static inline TimeADT getTimeFromHMS(uint32 hour, uint8 min, uint8 sec) {
     return getTimeFromUnixTime(sec + min*60 + hour*3600);
 }
 
 class ODBCLoader : public UDParser {
 public:
-    ODBCLoader() : currentSlice(0), quirks(NoQuirks), modSupported(false),
+    ODBCLoader() : colInTable(0), currentSlice(0), quirks(NoQuirks), modSupported(false),
                    threaded(false), workersStarted(false), threadCountParam(DEF_THREAD),
                    canceledFlag(false) {}
 
@@ -99,6 +95,9 @@ private:
     SQLSMALLINT numcols;
     SQLULEN nfrows;		// Number of fetched rows
     size_t rowset;
+
+    int colInTable;             // # columns in the current Vertica target
+    std::vector<int> vidx;      // target column index of each fetched column
 
     // One SQL string per slice; a single entry means no split.
     std::vector<std::string> sliceQueries;
@@ -972,6 +971,8 @@ public:
     virtual void setup(ServerInterface &srvInterface, SizedColumnTypes &returnType) {
         // Capture our column types
         colInfo = returnType;
+        colInTable = (int)colInfo.getColumnCount() ;
+        vidx.clear() ;
 		bool src_rfilter = true ;       // Rows filtering flag
         bool src_cfilter = true ;       // Column filtering flag
         bool oq_flag = false ;          // Query Ovverride flag
@@ -1088,7 +1089,6 @@ public:
             if (srvInterface.getParamReader().containsParameter("__query_col_name__") &&
                 !srvInterface.getParamReader().getStringRef("__query_col_name__").str().empty()) {
                 if (srvInterface.getParamReader().containsParameter("__query_col_idx__")) {
-                    colInTable = (int)colInfo.getColumnCount() ;
 #if LOADER_DEBUG
  srvInterface.log("DEBUG __query_col_name__=<%s>",srvInterface.getParamReader().getStringRef("__query_col_name__").str().c_str());
  srvInterface.log("DEBUG __query_col_idx__=<%s>",srvInterface.getParamReader().getStringRef("__query_col_idx__").str().c_str());
@@ -1186,13 +1186,19 @@ srvInterface.log("-----> External Table Columns, colInTable=<%d>", colInTable);
         stype = (uint32 *)srvInterface.allocator->alloc(numcols * sizeof(uint32)) ;
         ctype = (SQLSMALLINT *)srvInterface.allocator->alloc(numcols * sizeof(SQLSMALLINT)) ;
 
-        // Plain COPY leaves vidx empty. Default to identity mapping and set
-        // colInTable so the pre-null loop covers all columns.
+        // Without __query_col_idx__ (e.g. plain COPY) use a fresh identity mapping.
         if (vidx.empty()) {
             for (SQLSMALLINT i = 0; i < numcols; i++) {
                 vidx.push_back(i);
             }
-            colInTable = numcols;
+        }
+        if (vidx.size() != (size_t)numcols) {
+            vt_report_error(0, "Error:  __query_col_idx__ lists %zu columns but the remote query returned %d columns", vidx.size(), (int)numcols);
+        }
+        for (size_t i = 0; i < vidx.size(); i++) {
+            if (vidx[i] < 0 || vidx[i] >= colInTable) {
+                vt_report_error(0, "Error:  Column index %d is outside the %d target columns", vidx[i], colInTable);
+            }
         }
 
         // Set up column-data buffers
