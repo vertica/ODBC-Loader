@@ -883,8 +883,8 @@ public:
             return DONE;
         }
 
-        // ---- Single-slice path (unchanged) ----
-        // Every so many iterations we want to
+        // ---- Single-slice path ----
+        // Every so many rows (checked per fetched rowset) we want to
         // break out and check for Vertica cancel messages
         uint32 iter_counter = 0;
 
@@ -911,12 +911,14 @@ public:
             }     // End FOR EACH COLUMN
 
             writer->next();	// avanzamento alla riga successiva (scrive e avanza il cursor)
-
-            if (++iter_counter == ROWS_PER_BREAK) {
-                // Periodically yield and let upstream do its thing
-                return KEEP_GOING;
-            }
+            iter_counter++;
           }      // End FOR EACH ROW
+
+          // Yield only at a rowset boundary: the row index is not kept across
+          // process() calls, so the next call always begins with a fresh SQLFetch().
+          if (iter_counter >= ROWS_PER_BREAK) {
+              return KEEP_GOING;
+          }
         }        // End FETCH LOOP
 
         // If SQLFetch() failed for some reason, report it
