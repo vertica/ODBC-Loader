@@ -1,0 +1,103 @@
+Timing is off.
+CREATE TABLE
+CREATE TABLE
+ Rows Loaded 
+-------------
+          10
+(1 row)
+
+ nrows | nn_i | sum_i | len_v | nn_n 
+-------+------+-------+-------+------
+    10 |    9 |    45 |    54 |    9
+(1 row)
+
+TRUNCATE TABLE
+ Rows Loaded 
+-------------
+           3
+(1 row)
+
+ id  |  name   
+-----+---------
+ 101 | Alice
+ 102 | Bob
+ 103 | Charlie
+(3 rows)
+
+TRUNCATE TABLE
+ Rows Loaded 
+-------------
+          10
+(1 row)
+
+ nrows | nn_i | sum_i | len_v | nn_n 
+-------+------+-------+-------+------
+    10 |    9 |    45 |    54 |    9
+(1 row)
+
+TRUNCATE TABLE
+ Rows Loaded 
+-------------
+           3
+(1 row)
+
+ id  |  name   
+-----+---------
+ 101 | Alice
+ 102 | Bob
+ 103 | Charlie
+(3 rows)
+
+TRUNCATE TABLE
+CREATE TABLE
+ id  |  name   
+-----+---------
+ 101 | Alice
+ 102 | Bob
+ 103 | Charlie
+(3 rows)
+
+  name   
+---------
+ Alice
+ Bob
+ Charlie
+(3 rows)
+
+ Rows Loaded 
+-------------
+          10
+(1 row)
+
+ nrows | nn_i | sum_i | len_v | nn_n 
+-------+------+-------+-------+------
+    10 |    9 |    45 |    54 |    9
+(1 row)
+
+TRUNCATE TABLE
+ Rows Loaded 
+-------------
+          10
+(1 row)
+
+ nrows | nn_i | sum_i | len_v | nn_n 
+-------+------+-------+-------+------
+    10 |    9 |    45 |    54 |    0
+(1 row)
+
+TRUNCATE TABLE
+ Rows Loaded 
+-------------
+           3
+(1 row)
+
+ id  |  name   
+-----+---------
+ 101 | Alice
+ 102 | Bob
+ 103 | Charlie
+(3 rows)
+
+DROP TABLE
+DROP TABLE
+DROP TABLE

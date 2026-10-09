@@ -94,6 +94,23 @@ test:
 		      s/^vsql: ERROR \d+:.*message: /vsql: ERROR: /; \
 		      s/mariadb/MySQL/ig; ' $(TMPDIR)/multithread_test.out) && echo "[✓] Multi-threaded fetch test validation passed" || (echo "[✗] Multi-threaded fetch test validation failed" && exit 1)
 	@echo ""
+	@echo "[*] Running Column State Test..."
+	@echo ""
+	@$(VSQL) -f tests/column_state_test.sql 2>&1 | tee $(TMPDIR)/column_state_test.out | perl -pe 's/^vsql:[\/_:\w\.]* /vsql: /; \
+	              s/\[ODBC[^\]]*\]/[...]/g; \
+		      s/\[mysql[^\]]*\]/[...]/g; \
+		      s/(Error parsing .* )\(.*\)$$/$$1(...)/; \
+		      s/^vsql: ERROR \d+:.*message: /vsql: ERROR: /; \
+		      s/mariadb/MySQL/ig; '
+	@echo ""
+	@echo "[*] Validating column state test output..."
+	@diff -u tests/expected/column_state_test.out <(perl -pe 's/^vsql:[\/_:\w\.]* /vsql: /; \
+	              s/\[ODBC[^\]]*\]/[...]/g; \
+		      s/\[mysql[^\]]*\]/[...]/g; \
+		      s/(Error parsing .* )\(.*\)$$/$$1(...)/; \
+		      s/^vsql: ERROR \d+:.*message: /vsql: ERROR: /; \
+		      s/mariadb/MySQL/ig; ' $(TMPDIR)/column_state_test.out) && echo "[✓] Column state test validation passed" || (echo "[✗] Column state test validation failed" && exit 1)
+	@echo ""
 	@echo "========================================="
 	@echo "✓ ALL TESTS SUCCESSFUL"
 	@echo "========================================="
