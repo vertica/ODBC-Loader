@@ -8,6 +8,7 @@
 #include <sqlext.h>
 #include <string.h>
 #include <stdlib.h>
+#include <errno.h>
 #include <string>
 #include <iostream>
 #include <vector>
@@ -353,12 +354,31 @@ private:
         while (*s == ' ') s++;
         if (*s == '\0') return false;
         char *end = NULL;
+        errno = 0;
         long long v = strtoll(s, &end, 10);
         if (end == s) return false;             // no digits consumed
+        if (errno == ERANGE) return false;      // outside long long; never clamp
         while (*end == ' ') end++;              // tolerate trailing spaces
         if (*end != '\0') return false;         // trailing junk -> not an integer
         out = v;
         return true;
+    }
+
+    // True only for native integer types; a reported NUMERIC/DECIMAL scale of 0 does not
+    // prove every value is integral (e.g. unconstrained PostgreSQL NUMERIC).
+    static bool isExactIntegerColumn(SQLHSTMT h, SQLUSMALLINT col) {
+        SQLSMALLINT dataType = 0, decimalDigits = 0, nullable = 0;
+        SQLULEN colSize = 0;
+        if (!SQL_SUCCEEDED(SQLDescribeCol(h, col, NULL, 0, NULL, &dataType, &colSize,
+                                          &decimalDigits, &nullable))) {
+            return false;
+        }
+        switch (dataType) {
+        case SQL_TINYINT: case SQL_SMALLINT: case SQL_INTEGER: case SQL_BIGINT:
+            return true;
+        default:
+            return false;
+        }
     }
 
     // Probes MIN/MAX split bounds; returns false on any error so the caller can fall back.
@@ -379,7 +399,9 @@ private:
             // Fetch as strings so we can validate integer-ness ourselves.
             SQLBindCol(pstmt, 1, SQL_C_CHAR, minbuf, sizeof(minbuf), &minlen);
             SQLBindCol(pstmt, 2, SQL_C_CHAR, maxbuf, sizeof(maxbuf), &maxlen);
-            if (SQL_SUCCEEDED(SQLFetch(pstmt)) &&
+            // Whole-number text alone is not enough: DOUBLE MIN/MAX can print as "0" and "2".
+            if (isExactIntegerColumn(pstmt, 1) && isExactIntegerColumn(pstmt, 2) &&
+                SQL_SUCCEEDED(SQLFetch(pstmt)) &&
                 minlen != SQL_NULL_DATA && maxlen != SQL_NULL_DATA &&
                 parseWholeInteger(minbuf, lo) && parseWholeInteger(maxbuf, hi)) {
                 ok = (lo <= hi);
@@ -412,7 +434,7 @@ private:
         long long lo = 0, hi = 0;
         if (!std::regex_match(splitColumn, re_ident) ||
             !probeSplitBounds(srvInterface, baseQuery, splitColumn, lo, hi)) {
-            srvInterface.log("ODBC Loader: split_column '%s' unusable (missing, non-integer, reserved/quoted, or pruned); falling back to single-connection load",
+            srvInterface.log("ODBC Loader: split_column '%s' unusable (missing, non-integer, out-of-range, reserved/quoted, or pruned); falling back to single-connection load",
                              splitColumn.c_str());
             sliceQueries.push_back(baseQuery);
             return;
@@ -438,11 +460,12 @@ private:
             // Range split: contiguous [lo, hi] chunks; __int128 avoids overflow.
             __int128 count = (__int128)hi - (__int128)lo + 1;
             for (int k = 0; k < threadCount; k++) {
-                long long startIdx = (long long)((count * k) / threadCount);
-                long long endIdx   = (long long)((count * (k + 1)) / threadCount);
+                // Offsets reach 2^64 on a full BIGINT span; only the final endpoints fit in long long.
+                __int128 startIdx = (count * k) / threadCount;
+                __int128 endIdx   = (count * (k + 1)) / threadCount;
                 if (startIdx >= endIdx) continue;   // more slices than distinct values
-                long long sliceLo = lo + startIdx;
-                long long sliceHi = lo + endIdx - 1;
+                long long sliceLo = (long long)((__int128)lo + startIdx);
+                long long sliceHi = (long long)((__int128)lo + endIdx - 1);
                 std::ostringstream q;
                 q << "SELECT * FROM ( " << baseQuery << " ) t WHERE (" << splitColumn
                   << " BETWEEN " << sliceLo << " AND " << sliceHi << ")";

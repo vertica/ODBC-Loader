@@ -138,7 +138,7 @@ CREATE  EXTERNAL  TABLE  public.epeople(
 ) ;
 ```
 
-The loader falls back to a single connection - without failing the load - when ``split_column`` is missing, is not a bare identifier, is not integer-valued, or has been pruned out of the remote query. The reason is written to the UDx log. Rows are **not** returned in a deterministic order when more than one slice is used. A slice query may also be executed more than once (the first slice runs once on the coordinating connection to derive column metadata, then again on its worker), so the remote query should be free of side effects.
+The loader falls back to a single connection - without failing the load - when ``split_column`` is missing, is not a bare identifier, is not integer-valued (including non-integral keys or MIN/MAX outside the signed 64-bit range), or has been pruned out of the remote query. Only native integer split columns (``TINYINT``/``SMALLINT``/``INTEGER``/``BIGINT``) are split; ``NUMERIC``/``DECIMAL`` keys, including whole-valued ones, fall back to a single connection and still load every row. The reason is written to the UDx log. Rows are **not** returned in a deterministic order when more than one slice is used. A slice query may also be executed more than once (the first slice runs once on the coordinating connection to derive column metadata, then again on its worker), so the remote query should be free of side effects.
 
 **Memory.** Each worker binds its own ``rowset``-sized fetch buffers and a small fixed number of converted batches (currently 8) may be queued, so the buffered memory is roughly ``thread_count x rowset x row_width``. ``thread_count`` multiplies the cost of ``rowset``: raising both at once is the easy way to exceed ``FencedUDxMemoryLimitMB``.
 
