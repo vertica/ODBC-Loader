@@ -114,6 +114,120 @@ SELECT id, name FROM public.mt_people ORDER BY id;
 COPY mt_target WITH SOURCE ODBCSource() PARSER ODBCLoader(connect='DSN=MySQL', query='SELECT i, ST_ASTEXT(ST_GEOMFROMTEXT(CASE WHEN i > 6 THEN ''oops'' ELSE ''POINT(1 1)'' END)) AS v FROM testdb.test_source;', thread_count=3, split_column='i');
 SELECT count(*) AS nrows FROM mt_target;
 
+-- Tests 17-28 are the regression guard for VTA-118933. Each fixture is built inline
+-- on the MySQL side and loaded four ways (single, default, range, modulo); all four
+-- must list every row. Listings are ordered by payload, since SUM over extreme keys
+-- would overflow.
+CREATE TABLE mt_bigint (id NUMERIC(19,0), payload INT);
+CREATE TABLE mt_numeric (id NUMERIC(38,0), payload INT);
+CREATE TABLE mt_fraction (id NUMERIC(38,3), payload INT);
+
+-- Test 17: extreme BIGINT keys spanning the full signed 64-bit range, single connection; the reference listing
+-- Range offsets above LLONG_MAX used to wrap and drop the slice holding -1. The target
+-- is NUMERIC(19,0) because Vertica INT stores -9223372036854775808 as NULL.
+COPY mt_bigint WITH SOURCE ODBCSource() PARSER ODBCLoader(connect='DSN=MySQL', query='SELECT CAST(-9223372036854775808 AS SIGNED) AS id, 1 AS payload UNION ALL SELECT CAST(-9223372036854775807 AS SIGNED), 2 UNION ALL SELECT CAST(-1 AS SIGNED), 3 UNION ALL SELECT CAST(0 AS SIGNED), 4 UNION ALL SELECT CAST(1 AS SIGNED), 5 UNION ALL SELECT CAST(9223372036854775806 AS SIGNED), 6 UNION ALL SELECT CAST(9223372036854775807 AS SIGNED), 7;');
+SELECT id, payload FROM mt_bigint ORDER BY payload;
+SELECT count(*) AS nrows FROM mt_bigint;
+TRUNCATE TABLE mt_bigint;
+
+-- Test 18: extreme BIGINT keys spanning the full signed 64-bit range, default split (no split_method)
+COPY mt_bigint WITH SOURCE ODBCSource() PARSER ODBCLoader(connect='DSN=MySQL', query='SELECT CAST(-9223372036854775808 AS SIGNED) AS id, 1 AS payload UNION ALL SELECT CAST(-9223372036854775807 AS SIGNED), 2 UNION ALL SELECT CAST(-1 AS SIGNED), 3 UNION ALL SELECT CAST(0 AS SIGNED), 4 UNION ALL SELECT CAST(1 AS SIGNED), 5 UNION ALL SELECT CAST(9223372036854775806 AS SIGNED), 6 UNION ALL SELECT CAST(9223372036854775807 AS SIGNED), 7;', thread_count=4, split_column='id');
+SELECT id, payload FROM mt_bigint ORDER BY payload;
+SELECT count(*) AS nrows FROM mt_bigint;
+TRUNCATE TABLE mt_bigint;
+
+-- Test 19: extreme BIGINT keys spanning the full signed 64-bit range, explicit range split
+COPY mt_bigint WITH SOURCE ODBCSource() PARSER ODBCLoader(connect='DSN=MySQL', query='SELECT CAST(-9223372036854775808 AS SIGNED) AS id, 1 AS payload UNION ALL SELECT CAST(-9223372036854775807 AS SIGNED), 2 UNION ALL SELECT CAST(-1 AS SIGNED), 3 UNION ALL SELECT CAST(0 AS SIGNED), 4 UNION ALL SELECT CAST(1 AS SIGNED), 5 UNION ALL SELECT CAST(9223372036854775806 AS SIGNED), 6 UNION ALL SELECT CAST(9223372036854775807 AS SIGNED), 7;', thread_count=4, split_column='id', split_method='range');
+SELECT id, payload FROM mt_bigint ORDER BY payload;
+SELECT count(*) AS nrows FROM mt_bigint;
+TRUNCATE TABLE mt_bigint;
+
+-- Test 20: extreme BIGINT keys spanning the full signed 64-bit range, modulo split
+COPY mt_bigint WITH SOURCE ODBCSource() PARSER ODBCLoader(connect='DSN=MySQL', query='SELECT CAST(-9223372036854775808 AS SIGNED) AS id, 1 AS payload UNION ALL SELECT CAST(-9223372036854775807 AS SIGNED), 2 UNION ALL SELECT CAST(-1 AS SIGNED), 3 UNION ALL SELECT CAST(0 AS SIGNED), 4 UNION ALL SELECT CAST(1 AS SIGNED), 5 UNION ALL SELECT CAST(9223372036854775806 AS SIGNED), 6 UNION ALL SELECT CAST(9223372036854775807 AS SIGNED), 7;', thread_count=4, split_column='id', split_method='modulo');
+SELECT id, payload FROM mt_bigint ORDER BY payload;
+SELECT count(*) AS nrows FROM mt_bigint;
+TRUNCATE TABLE mt_bigint;
+
+-- Test 21: DECIMAL(38,0) keys whose MIN/MAX overflow long long, single connection; the reference listing
+-- strtoll() clamped the bounds to LLONG_MIN/LLONG_MAX and dropped 3 of 5 rows; the
+-- split must now fall back to one connection.
+COPY mt_numeric WITH SOURCE ODBCSource() PARSER ODBCLoader(connect='DSN=MySQL', query='SELECT CAST(-99999999999999999999999999999999999999 AS DECIMAL(38,0)) AS id, 1 AS payload UNION ALL SELECT CAST(-100 AS DECIMAL(38,0)), 2 UNION ALL SELECT CAST(0 AS DECIMAL(38,0)), 3 UNION ALL SELECT CAST(100 AS DECIMAL(38,0)), 4 UNION ALL SELECT CAST(99999999999999999999999999999999999999 AS DECIMAL(38,0)), 5;');
+SELECT id, payload FROM mt_numeric ORDER BY payload;
+SELECT count(*) AS nrows FROM mt_numeric;
+TRUNCATE TABLE mt_numeric;
+
+-- Test 22: DECIMAL(38,0) keys whose MIN/MAX overflow long long, default split (no split_method)
+COPY mt_numeric WITH SOURCE ODBCSource() PARSER ODBCLoader(connect='DSN=MySQL', query='SELECT CAST(-99999999999999999999999999999999999999 AS DECIMAL(38,0)) AS id, 1 AS payload UNION ALL SELECT CAST(-100 AS DECIMAL(38,0)), 2 UNION ALL SELECT CAST(0 AS DECIMAL(38,0)), 3 UNION ALL SELECT CAST(100 AS DECIMAL(38,0)), 4 UNION ALL SELECT CAST(99999999999999999999999999999999999999 AS DECIMAL(38,0)), 5;', thread_count=4, split_column='id');
+SELECT id, payload FROM mt_numeric ORDER BY payload;
+SELECT count(*) AS nrows FROM mt_numeric;
+TRUNCATE TABLE mt_numeric;
+
+-- Test 23: DECIMAL(38,0) keys whose MIN/MAX overflow long long, explicit range split
+COPY mt_numeric WITH SOURCE ODBCSource() PARSER ODBCLoader(connect='DSN=MySQL', query='SELECT CAST(-99999999999999999999999999999999999999 AS DECIMAL(38,0)) AS id, 1 AS payload UNION ALL SELECT CAST(-100 AS DECIMAL(38,0)), 2 UNION ALL SELECT CAST(0 AS DECIMAL(38,0)), 3 UNION ALL SELECT CAST(100 AS DECIMAL(38,0)), 4 UNION ALL SELECT CAST(99999999999999999999999999999999999999 AS DECIMAL(38,0)), 5;', thread_count=4, split_column='id', split_method='range');
+SELECT id, payload FROM mt_numeric ORDER BY payload;
+SELECT count(*) AS nrows FROM mt_numeric;
+TRUNCATE TABLE mt_numeric;
+
+-- Test 24: DECIMAL(38,0) keys whose MIN/MAX overflow long long, modulo split
+COPY mt_numeric WITH SOURCE ODBCSource() PARSER ODBCLoader(connect='DSN=MySQL', query='SELECT CAST(-99999999999999999999999999999999999999 AS DECIMAL(38,0)) AS id, 1 AS payload UNION ALL SELECT CAST(-100 AS DECIMAL(38,0)), 2 UNION ALL SELECT CAST(0 AS DECIMAL(38,0)), 3 UNION ALL SELECT CAST(100 AS DECIMAL(38,0)), 4 UNION ALL SELECT CAST(99999999999999999999999999999999999999 AS DECIMAL(38,0)), 5;', thread_count=4, split_column='id', split_method='modulo');
+SELECT id, payload FROM mt_numeric ORDER BY payload;
+SELECT count(*) AS nrows FROM mt_numeric;
+TRUNCATE TABLE mt_numeric;
+
+-- Test 25: DOUBLE keys 0, 0.5, 1, 1.5, 2, single connection; the reference listing
+-- MIN/MAX print as whole numbers, but the DOUBLE type must force the fallback;
+-- otherwise 0.5 and 1.5 fall between the integer BETWEEN ranges.
+COPY mt_fraction WITH SOURCE ODBCSource() PARSER ODBCLoader(connect='DSN=MySQL', query='SELECT 0e0 AS id, 1 AS payload UNION ALL SELECT 0.5e0, 2 UNION ALL SELECT 1e0, 3 UNION ALL SELECT 1.5e0, 4 UNION ALL SELECT 2e0, 5;');
+SELECT id, payload FROM mt_fraction ORDER BY payload;
+SELECT count(*) AS nrows FROM mt_fraction;
+TRUNCATE TABLE mt_fraction;
+
+-- Test 26: DOUBLE keys 0, 0.5, 1, 1.5, 2, default split (no split_method)
+COPY mt_fraction WITH SOURCE ODBCSource() PARSER ODBCLoader(connect='DSN=MySQL', query='SELECT 0e0 AS id, 1 AS payload UNION ALL SELECT 0.5e0, 2 UNION ALL SELECT 1e0, 3 UNION ALL SELECT 1.5e0, 4 UNION ALL SELECT 2e0, 5;', thread_count=4, split_column='id');
+SELECT id, payload FROM mt_fraction ORDER BY payload;
+SELECT count(*) AS nrows FROM mt_fraction;
+TRUNCATE TABLE mt_fraction;
+
+-- Test 27: DOUBLE keys 0, 0.5, 1, 1.5, 2, explicit range split
+COPY mt_fraction WITH SOURCE ODBCSource() PARSER ODBCLoader(connect='DSN=MySQL', query='SELECT 0e0 AS id, 1 AS payload UNION ALL SELECT 0.5e0, 2 UNION ALL SELECT 1e0, 3 UNION ALL SELECT 1.5e0, 4 UNION ALL SELECT 2e0, 5;', thread_count=4, split_column='id', split_method='range');
+SELECT id, payload FROM mt_fraction ORDER BY payload;
+SELECT count(*) AS nrows FROM mt_fraction;
+TRUNCATE TABLE mt_fraction;
+
+-- Test 28: DOUBLE keys 0, 0.5, 1, 1.5, 2, modulo split
+COPY mt_fraction WITH SOURCE ODBCSource() PARSER ODBCLoader(connect='DSN=MySQL', query='SELECT 0e0 AS id, 1 AS payload UNION ALL SELECT 0.5e0, 2 UNION ALL SELECT 1e0, 3 UNION ALL SELECT 1.5e0, 4 UNION ALL SELECT 2e0, 5;', thread_count=4, split_column='id', split_method='modulo');
+SELECT id, payload FROM mt_fraction ORDER BY payload;
+SELECT count(*) AS nrows FROM mt_fraction;
+TRUNCATE TABLE mt_fraction;
+
+-- Test 29: whole-valued DECIMAL(10,0) keys 1-5, single connection; the reference listing
+-- Only native integer keys are split; DECIMAL falls back even when every value is whole.
+COPY mt_numeric WITH SOURCE ODBCSource() PARSER ODBCLoader(connect='DSN=MySQL', query='SELECT CAST(1 AS DECIMAL(10,0)) AS id, 1 AS payload UNION ALL SELECT CAST(2 AS DECIMAL(10,0)), 2 UNION ALL SELECT CAST(3 AS DECIMAL(10,0)), 3 UNION ALL SELECT CAST(4 AS DECIMAL(10,0)), 4 UNION ALL SELECT CAST(5 AS DECIMAL(10,0)), 5;');
+SELECT id, payload FROM mt_numeric ORDER BY payload;
+SELECT count(*) AS nrows FROM mt_numeric;
+TRUNCATE TABLE mt_numeric;
+
+-- Test 30: whole-valued DECIMAL(10,0) keys 1-5, default split (no split_method)
+COPY mt_numeric WITH SOURCE ODBCSource() PARSER ODBCLoader(connect='DSN=MySQL', query='SELECT CAST(1 AS DECIMAL(10,0)) AS id, 1 AS payload UNION ALL SELECT CAST(2 AS DECIMAL(10,0)), 2 UNION ALL SELECT CAST(3 AS DECIMAL(10,0)), 3 UNION ALL SELECT CAST(4 AS DECIMAL(10,0)), 4 UNION ALL SELECT CAST(5 AS DECIMAL(10,0)), 5;', thread_count=4, split_column='id');
+SELECT id, payload FROM mt_numeric ORDER BY payload;
+SELECT count(*) AS nrows FROM mt_numeric;
+TRUNCATE TABLE mt_numeric;
+
+-- Test 31: whole-valued DECIMAL(10,0) keys 1-5, explicit range split
+COPY mt_numeric WITH SOURCE ODBCSource() PARSER ODBCLoader(connect='DSN=MySQL', query='SELECT CAST(1 AS DECIMAL(10,0)) AS id, 1 AS payload UNION ALL SELECT CAST(2 AS DECIMAL(10,0)), 2 UNION ALL SELECT CAST(3 AS DECIMAL(10,0)), 3 UNION ALL SELECT CAST(4 AS DECIMAL(10,0)), 4 UNION ALL SELECT CAST(5 AS DECIMAL(10,0)), 5;', thread_count=4, split_column='id', split_method='range');
+SELECT id, payload FROM mt_numeric ORDER BY payload;
+SELECT count(*) AS nrows FROM mt_numeric;
+TRUNCATE TABLE mt_numeric;
+
+-- Test 32: whole-valued DECIMAL(10,0) keys 1-5, modulo split
+COPY mt_numeric WITH SOURCE ODBCSource() PARSER ODBCLoader(connect='DSN=MySQL', query='SELECT CAST(1 AS DECIMAL(10,0)) AS id, 1 AS payload UNION ALL SELECT CAST(2 AS DECIMAL(10,0)), 2 UNION ALL SELECT CAST(3 AS DECIMAL(10,0)), 3 UNION ALL SELECT CAST(4 AS DECIMAL(10,0)), 4 UNION ALL SELECT CAST(5 AS DECIMAL(10,0)), 5;', thread_count=4, split_column='id', split_method='modulo');
+SELECT id, payload FROM mt_numeric ORDER BY payload;
+SELECT count(*) AS nrows FROM mt_numeric;
+TRUNCATE TABLE mt_numeric;
+
 -- Clean up
 DROP TABLE public.mt_people;
 DROP TABLE mt_target;
+DROP TABLE mt_bigint;
+DROP TABLE mt_numeric;
+DROP TABLE mt_fraction;
