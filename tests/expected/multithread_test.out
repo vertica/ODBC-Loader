@@ -99,6 +99,16 @@ TRUNCATE TABLE
 (1 row)
 
 TRUNCATE TABLE
+vsql: ERROR: Error:  Invalid split_method='bogus'. Permitted values are 'range' and 'modulo'
+vsql: ERROR: Error:  Invalid split_method='bogus'. Permitted values are 'range' and 'modulo'
+vsql: ERROR: Error:  Invalid split_method='Bogus'. Permitted values are 'range' and 'modulo'
+vsql: ERROR: Error:  Invalid split_method='bogus'. Permitted values are 'range' and 'modulo'
+vsql: ERROR: Error:  Invalid split_method=''. Permitted values are 'range' and 'modulo'
+ nrows 
+-------
+     0
+(1 row)
+
  Rows Loaded 
 -------------
           10

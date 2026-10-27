@@ -122,7 +122,7 @@ By default the ODBCLoader opens one connection to the remote database and fetche
 | --- 			| --- 		| --- 		|
 | ``thread_count`` 	| 1 		| Number of slices/worker threads, 1..64. 1 keeps the original single-connection behaviour. |
 | ``split_column`` 	| *(none)* 	| Bare (unquoted) name of the integer column to split on. Required; without it ``thread_count`` is ignored. |
-| ``split_method`` 	| ``range`` 	| ``range`` splits the ``MIN``/``MAX`` span into contiguous ``BETWEEN`` chunks. ``modulo`` uses ``MOD()``, which spreads skewed keys more evenly but is only used on engines known to support ``MOD()`` (PostgreSQL, Oracle, MySQL, MariaDB); elsewhere it degrades to ``range``. |
+| ``split_method`` 	| ``range`` 	| ``range`` splits the ``MIN``/``MAX`` span into contiguous ``BETWEEN`` chunks. ``modulo`` uses ``MOD()``, which spreads skewed keys more evenly but is only used on engines known to support ``MOD()`` (PostgreSQL, Oracle, MySQL, MariaDB); elsewhere it degrades to ``range``. Case-insensitive; any other value is rejected, even when no split takes place. |
 
 ```sql
 CREATE  EXTERNAL  TABLE  public.epeople(

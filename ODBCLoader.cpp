@@ -20,6 +20,7 @@
 #include <deque>
 #include <algorithm>
 #include <atomic>
+#include <stdexcept>
 
 // To deal with TimeTz and TimestampTz.
 // No standard native-SQL representation for these,
@@ -461,6 +462,57 @@ private:
         if (*end != '\0') return false;         // trailing junk -> not an integer
         out = v;
         return true;
+    }
+
+    // Parses the SDK-generated __query_col_idx__ list (e.g. "0,2,5"); blanks around a token are
+    // tolerated, anything else that is not a complete in-bounds index fails with 'err' set.
+    static bool parseColumnIndexList(const std::string &list, int targetCols,
+                                     std::vector<int> &out, std::string &err) {
+        out.clear();
+        size_t start = 0;
+        while (true) {
+            size_t comma = list.find(',', start);
+            std::string tok = list.substr(start, comma == std::string::npos ? std::string::npos : comma - start);
+            size_t b = tok.find_first_not_of(" \t");
+            tok = (b == std::string::npos) ? "" : tok.substr(b, tok.find_last_not_of(" \t") - b + 1);
+            std::ostringstream m;
+            m << "column index " << out.size() + 1 << " ";
+            if (tok.empty()) {
+                err = m.str() + "is empty";
+                return false;
+            }
+            if (tok[0] == '-' && tok.size() > 1 && tok.find_first_not_of("0123456789", 1) == std::string::npos) {
+                err = m.str() + "'" + tok + "' is negative";
+                return false;
+            }
+            if (tok.find_first_not_of("0123456789") != std::string::npos) {
+                err = m.str() + "'" + tok + "' is not a whole non-negative integer";
+                return false;
+            }
+            int v = 0;
+            try {
+                size_t used = 0;
+                v = std::stoi(tok, &used);
+                if (used != tok.size()) {
+                    err = m.str() + "'" + tok + "' is not a whole non-negative integer";
+                    return false;
+                }
+            } catch (const std::out_of_range &) {
+                err = m.str() + "'" + tok + "' is out of range";
+                return false;
+            } catch (const std::invalid_argument &) {
+                err = m.str() + "'" + tok + "' is not a whole non-negative integer";
+                return false;
+            }
+            if (v >= targetCols) {
+                m << "'" << tok << "' is outside the " << targetCols << " target columns";
+                err = m.str();
+                return false;
+            }
+            out.push_back(v);
+            if (comma == std::string::npos) return true;
+            start = comma + 1;
+        }
     }
 
     // True only for native integer types; a reported NUMERIC/DECIMAL scale of 0 does not
@@ -1289,11 +1341,15 @@ public:
         }
         std::string split_method = "range" ;
         if (srvInterface.getParamReader().containsParameter("split_method")) {
-            split_method = srvInterface.getParamReader().getStringRef("split_method").str() ;
+            std::string supplied = srvInterface.getParamReader().getStringRef("split_method").str() ;
+            split_method = supplied ;
             for (size_t i = 0 ; i < split_method.size() ; i++) {
                 char c = split_method[i] ;
                 if (c >= 'A' && c <= 'Z') split_method[i] = c - 'A' + 'a' ;
             }
+            // Checked here so disabled threading or a split-column fallback cannot skip it.
+            if (split_method != "range" && split_method != "modulo")
+                vt_report_error(0, "Error:  Invalid split_method='%s'. Permitted values are 'range' and 'modulo'", supplied.c_str());
         }
   
         // Check "hidden" parameters __pred_#__ to filter out rows
@@ -1350,11 +1406,10 @@ public:
 srvInterface.log("-----> External Table Columns, colInTable=<%d>", colInTable);
 #endif
                    std::string slist=srvInterface.getParamReader().getStringRef("__query_col_name__").str();
-                   std::stringstream ss_idx(srvInterface.getParamReader().getStringRef("__query_col_idx__").str());
-                   std::string tk_idx ;
-                   vidx.clear();
-                   while (std::getline(ss_idx, tk_idx, ',')) {
-		   	            vidx.push_back(stoi(tk_idx));
+                   std::string idx_list = srvInterface.getParamReader().getStringRef("__query_col_idx__").str();
+                   std::string idx_err ;
+                   if (!parseColumnIndexList(idx_list, colInTable, vidx, idx_err)) {
+                       vt_report_error(0, "Error:  Invalid __query_col_idx__='%s': %s", idx_list.c_str(), idx_err.c_str());
                    }
 
                    // MF to remove Vertica casts (::<data_type>)

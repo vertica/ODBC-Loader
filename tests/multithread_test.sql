@@ -58,8 +58,17 @@ COPY mt_target WITH SOURCE ODBCSource() PARSER ODBCLoader(connect='DSN=MySQL', q
 SELECT count(*) AS nrows, count(i) AS nn_i, sum(i) AS sum_i, sum(length(v)) AS len_v FROM mt_target;
 TRUNCATE TABLE mt_target;
 
--- Test 10: an unrecognized split_method uses the portable range split
+-- Test 10 (VTA-119248): a split_method other than range/modulo is rejected in setup() and
+-- loads nothing, also with threading disabled, no split column or a falling-back split column
 COPY mt_target WITH SOURCE ODBCSource() PARSER ODBCLoader(connect='DSN=MySQL', query='SELECT i, v FROM testdb.test_source;', thread_count=4, split_column='i', split_method='bogus');
+COPY mt_target WITH SOURCE ODBCSource() PARSER ODBCLoader(connect='DSN=MySQL', query='SELECT i, v FROM testdb.test_source;', thread_count=1, split_column='i', split_method='bogus');
+COPY mt_target WITH SOURCE ODBCSource() PARSER ODBCLoader(connect='DSN=MySQL', query='SELECT i, v FROM testdb.test_source;', split_method='Bogus');
+COPY mt_target WITH SOURCE ODBCSource() PARSER ODBCLoader(connect='DSN=MySQL', query='SELECT i, v FROM testdb.test_source;', thread_count=4, split_column='no_such_column', split_method='bogus');
+COPY mt_target WITH SOURCE ODBCSource() PARSER ODBCLoader(connect='DSN=MySQL', query='SELECT i, v FROM testdb.test_source;', thread_count=4, split_column='i', split_method='');
+SELECT count(*) AS nrows FROM mt_target;
+
+-- Same session afterwards: mixed-case 'Range' is normalized and the split load completes
+COPY mt_target WITH SOURCE ODBCSource() PARSER ODBCLoader(connect='DSN=MySQL', query='SELECT i, v FROM testdb.test_source;', thread_count=4, split_column='i', split_method='Range');
 SELECT count(*) AS nrows, count(i) AS nn_i, sum(i) AS sum_i, sum(length(v)) AS len_v FROM mt_target;
 TRUNCATE TABLE mt_target;
 
