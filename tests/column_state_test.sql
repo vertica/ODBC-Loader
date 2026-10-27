@@ -63,6 +63,22 @@ TRUNCATE TABLE cs_wide;
 -- Test 8: a plain narrow COPY after the External Table and wide loads still maps correctly
 COPY cs_narrow WITH SOURCE ODBCSource() PARSER ODBCLoader(connect='DSN=MySQL', query='SELECT id, name FROM testdb.people;');
 SELECT id, name FROM cs_narrow ORDER BY id;
+TRUNCATE TABLE cs_narrow;
+
+-- Test 9 (VTA-119247): unknown DSN, so the connection never opens. The connect error must
+-- be the one reported; handle release itself is not observable from SQL
+COPY cs_narrow WITH SOURCE ODBCSource() PARSER ODBCLoader(connect='DSN=NoSuchDSN', query='SELECT id, name FROM testdb.people;');
+SELECT count(*) AS nrows FROM cs_narrow;
+
+-- Test 10 (VTA-119247): the remote query fails after the connection opened. The query
+-- error must be the one reported and nothing is loaded
+COPY cs_narrow WITH SOURCE ODBCSource() PARSER ODBCLoader(connect='DSN=MySQL', query='SELECT id, name FROM testdb.no_such_table;');
+SELECT count(*) AS nrows FROM cs_narrow;
+
+-- Test 11 (VTA-119247): a threaded load in the same session still succeeds after both
+-- failures, with the checked rowset attributes on the main and worker connections
+COPY cs_narrow WITH SOURCE ODBCSource() PARSER ODBCLoader(connect='DSN=MySQL', query='SELECT id, name FROM testdb.people;', thread_count=2, split_column='id', rowset=1);
+SELECT id, name FROM cs_narrow ORDER BY id;
 
 -- Clean up
 DROP TABLE public.cs_epeople;

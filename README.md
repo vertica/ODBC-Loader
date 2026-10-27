@@ -113,7 +113,7 @@ CREATE  EXTERNAL  TABLE  public.epeople(
         rowset = 500
 ) ;
 ```
-Please consider that increasing this parameter will also increase the memory consumption of the ODBCLoader.
+Please consider that increasing this parameter will also increase the memory consumption of the ODBCLoader. If the ODBC driver rejects ``rowset`` or substitutes a different array size, the load fails rather than fetching with a size the buffers were not allocated for.
 
 ### Parallel fetch
 By default the ODBCLoader opens one connection to the remote database and fetches the result set serially. If the remote query has an **integer** column with a reasonably even spread, you can split it into slices and fetch them concurrently, each slice on its own ODBC connection:
@@ -187,7 +187,7 @@ When pushing predicates down to the external database, ODBCLoader performs the f
 3. ``ANY(ARRAY)`` will be converted to ``IN()``. For example ``ID = ANY(ARRAY[1,2,3])`` will be converted to ``ID IN(1,2,3)``
 
 ### Database Specific Notes
-**ORACLE**.  All integers in Vertica are 64-bit integers.  Oracle doesn't support 64-bit integers; their ODBC driver can't even cast to them on request.  This code contains a quirk/workaround for Oracle that retrieves integers as C strings and re-parses them.  However, the quirk doesn't reliably detect Oracle database servers right now. You can force Oracle with an obvious modification to the setQuirksMode() function in ODBCLoader.cpp.  If you know of a more-reliable way to detect Oracle, or a better workaround, patches welcome :-)                                                                              
+**ORACLE**.  All integers in Vertica are 64-bit integers.  Oracle doesn't support 64-bit integers; their ODBC driver can't even cast to them on request.  This code contains a quirk/workaround for Oracle that retrieves integers as C strings and re-parses them.  However, the quirk doesn't reliably detect Oracle database servers right now. The server type comes from ``SQLGetInfo(SQL_SERVER_NAME)``; if the driver cannot report it, the load fails with the driver's diagnostics. You can force Oracle with an obvious modification to the setQuirksMode() function in ODBCLoader.cpp.  If you know of a more-reliable way to detect Oracle, or a better workaround, patches welcome :-)                                                                              
 
 **MYSQL**. The MySQL ODBC driver comes in both a thread-safe and thread-unsafe build and configuration. The thread-unsafe version is KNOWN TO CRASH VERTICA if used in multiple COPY statements concurrently! (Vertica is, after all, highly multithreaded). Linux distributions aren't consistently careful to package thread-safe defaults. So if you're connecting to MySQL, be very careful to set up a thread-safe configuration.
 

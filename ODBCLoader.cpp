@@ -60,9 +60,10 @@ static inline TimeADT getTimeFromHMS(uint32 hour, uint8 min, uint8 sec) {
 
 class ODBCLoader : public UDParser {
 public:
-    ODBCLoader() : colInTable(0), currentSlice(0), quirks(NoQuirks), modSupported(false),
+    ODBCLoader() : env(SQL_NULL_HENV), dbc(SQL_NULL_HDBC), stmt(SQL_NULL_HSTMT), connected(false),
+                   colInTable(0), currentSlice(0), quirks(NoQuirks), modSupported(false),
                    threaded(false), workersStarted(false), threadCountParam(DEF_THREAD),
-                   canceledFlag(false) {}
+                   canceledFlag(false), loadCompleted(false) {}
 
     // Maximum length of diagnostic-message text
     // that we can receive from the ODBC driver.
@@ -93,6 +94,7 @@ private:
     SQLHENV env;
     SQLHDBC dbc;
     SQLHSTMT stmt;
+    bool connected;             // from a successful SQLDriverConnect() until a successful SQLDisconnect()
     SQLSMALLINT numcols;
     SQLULEN nfrows;		// Number of fetched rows
     size_t rowset;
@@ -172,6 +174,7 @@ private:
         bool failed;
         std::string message;    // driver message
         std::string sqlstate;   // SQLSTATE
+        std::vector<std::string> warnings;  // accepted driver warnings; logged by the main thread after join
         WorkerStatus() : failed(false) {}
     };
     std::vector<WorkerStatus> workerStatus;
@@ -182,6 +185,9 @@ private:
 
     // Published by the main thread; workers must not call the SDK's isCanceled().
     std::atomic<bool> canceledFlag;
+
+    // Set only when process() delivered every row; otherwise destroy() must not hide the primary error.
+    bool loadCompleted;
 
     // Gets the Vertica type of the specified column
     VerticaType getVerticaTypeOfCol(SQLSMALLINT colnum) {
@@ -346,6 +352,99 @@ private:
                                  fn_name, r, SQL_SUCCESS, SQL_SUCCESS_WITH_INFO, SQL_ERROR,
                                  SQL_INVALID_HANDLE, SQL_STILL_EXECUTING, SQL_NO_DATA, SQL_NEED_DATA);
         }
+    }
+
+    // Formats the first diagnostic record like handleReturnCode() but never raises.
+    // Call it before any later ODBC call on the same handle replaces the record.
+    static std::string diagText(SQLSMALLINT handle_type, SQLHANDLE handle, SQLRETURN r,
+                                const char *fn_name, std::string *sqlstate = NULL) {
+        std::ostringstream m;
+        if (r == SQL_INVALID_HANDLE) {
+            m << fn_name << " failed with internal error SQL_INVALID_HANDLE";
+            return m.str();
+        }
+        SQLCHAR state_rec[6] = {0};
+        SQLINTEGER native_code = 0;
+        SQLCHAR message_text[MAX_DIAG_MSG_TEXT_LENGTH] = {0};
+        SQLSMALLINT msg_length = 0;
+        SQLRETURN r_diag = SQLGetDiagRec(handle_type, handle, 1, &state_rec[0], &native_code,
+                                         &message_text[0], MAX_DIAG_MSG_TEXT_LENGTH, &msg_length);
+        m << fn_name << (r == SQL_SUCCESS_WITH_INFO ? " emitted a warning" : " failed");
+        if (!SQL_SUCCEEDED(r_diag)) {
+            m << " with return code " << (int)r << " (no diagnostic record available)";
+            return m.str();
+        }
+        if (sqlstate) *sqlstate = (char*)state_rec;
+        m << " with error code " << (char*)state_rec << ", native code " << (int)native_code
+          << " [" << (char*)message_text
+          << (msg_length >= (SQLSMALLINT)MAX_DIAG_MSG_TEXT_LENGTH ? "... (message truncated)" : "") << "]";
+        return m.str();
+    }
+
+    struct RowsetAttrResult {
+        bool ok;
+        std::string message;                // failure description, including diagnostics
+        std::string sqlstate;
+        std::vector<std::string> warnings;  // accepted SQL_SUCCESS_WITH_INFO diagnostics
+        RowsetAttrResult() : ok(true) {}
+    };
+
+    // Applies column-wise binding, the rowset size and the rows-fetched pointer. Fetch buffers
+    // are sized for exactly these values, so a rejected or substituted value fails the step.
+    // Never raises and never touches the SDK, so worker threads may call it.
+    static RowsetAttrResult setRowsetAttrs(SQLHSTMT h, SQLULEN rows, SQLULEN *fetched) {
+        struct Step { SQLINTEGER attr; SQLPOINTER value; SQLULEN number; const char *fn_name; };
+        const Step steps[] = {
+            { SQL_ATTR_ROW_BIND_TYPE,    (SQLPOINTER)SQL_BIND_BY_COLUMN, SQL_BIND_BY_COLUMN, "SQLSetStmtAttr(SQL_ATTR_ROW_BIND_TYPE)" },
+            { SQL_ATTR_ROW_ARRAY_SIZE,   (SQLPOINTER)rows,               rows,               "SQLSetStmtAttr(SQL_ATTR_ROW_ARRAY_SIZE)" },
+            { SQL_ATTR_ROWS_FETCHED_PTR, (SQLPOINTER)fetched,            0,                  "SQLSetStmtAttr(SQL_ATTR_ROWS_FETCHED_PTR)" },
+        };
+        RowsetAttrResult res;
+        for (size_t k = 0; k < sizeof(steps) / sizeof(steps[0]); k++) {
+            const Step &s = steps[k];
+            SQLRETURN r = SQLSetStmtAttr(h, s.attr, s.value, 0);
+            if (r == SQL_SUCCESS) continue;
+            std::string state;
+            std::string text = diagText(SQL_HANDLE_STMT, h, r, s.fn_name, &state);
+            if (r != SQL_SUCCESS_WITH_INFO) {
+                res.ok = false;
+                res.message = text;
+                res.sqlstate = state;
+                return res;
+            }
+
+            // A warning may mean the driver substituted another value (01S02); read back what it uses.
+            bool same = false;
+            std::ostringstream mismatch;
+            SQLRETURN rg;
+            if (s.attr == SQL_ATTR_ROWS_FETCHED_PTR) {
+                SQLULEN *actual = NULL;
+                rg = SQLGetStmtAttr(h, s.attr, &actual, SQL_IS_POINTER, NULL);
+                same = (actual == fetched);
+                mismatch << "the driver did not keep the requested rows-fetched pointer";
+            } else {
+                SQLULEN actual = 0;
+                rg = SQLGetStmtAttr(h, s.attr, &actual, 0, NULL);
+                same = (actual == s.number);
+                mismatch << "the driver uses " << (unsigned long long)actual
+                         << " instead of the requested " << (unsigned long long)s.number;
+            }
+            if (!SQL_SUCCEEDED(rg)) {
+                res.ok = false;
+                res.message = text + "; " + diagText(SQL_HANDLE_STMT, h, rg, "SQLGetStmtAttr()") +
+                              ", so the value in effect is unknown";
+                res.sqlstate = state;
+                return res;
+            }
+            if (!same) {
+                res.ok = false;
+                res.message = text + "; " + mismatch.str();
+                res.sqlstate = state;
+                return res;
+            }
+            res.warnings.push_back(text);
+        }
+        return res;
     }
 
     // Strict base-10 parse; rejects non-integer input (text, dates, decimals).
@@ -686,9 +785,18 @@ private:
             done = true;
         }
         if (!done) {
-            SQLSetStmtAttr(wstmt, SQL_ATTR_ROW_BIND_TYPE, (SQLPOINTER)SQL_BIND_BY_COLUMN, 0);
-            SQLSetStmtAttr(wstmt, SQL_ATTR_ROW_ARRAY_SIZE, (SQLPOINTER)rowset, 0);
-            SQLSetStmtAttr(wstmt, SQL_ATTR_ROWS_FETCHED_PTR, &wnfrows, 0);
+            // Never execute or fetch with rowset settings the driver rejected or changed.
+            RowsetAttrResult attrs = setRowsetAttrs(wstmt, (SQLULEN)rowset, &wnfrows);
+            workerStatus[workerIdx].warnings = attrs.warnings;
+            if (!attrs.ok) {
+                WorkerStatus &ws = workerStatus[workerIdx];
+                ws.failed = true;
+                ws.sqlstate = attrs.sqlstate;
+                ws.message = attrs.message;
+                done = true;
+            }
+        }
+        if (!done) {
             if (!SQL_SUCCEEDED(SQLExecDirect(wstmt, (SQLCHAR*)sliceQuery.c_str(), SQL_NTS))) {
                 captureWorkerError(workerIdx, SQL_HANDLE_STMT, wstmt, "SQLExecDirect(worker)");
                 done = true;
@@ -824,6 +932,108 @@ private:
         return false;
     }
 
+    // Logs a cleanup warning or records a failure. Diagnostics are read immediately, but never
+    // after a successful free, because the handle no longer exists.
+    void noteCleanupResult(ServerInterface &srvInterface, SQLRETURN r, SQLSMALLINT handle_type,
+                           SQLHANDLE handle, const char *fn_name, bool frees_handle,
+                           std::vector<std::string> &errors, std::string *sqlstate = NULL) {
+        if (r == SQL_SUCCESS || (r == SQL_SUCCESS_WITH_INFO && frees_handle)) return;
+        std::string text = diagText(handle_type, handle, r, fn_name, sqlstate);
+        if (r == SQL_SUCCESS_WITH_INFO) {
+            srvInterface.log("ODBC Warning: %s", text.c_str());
+        } else {
+            errors.push_back(text);
+        }
+    }
+
+    // Frees stmt, commits (one rollback if that fails), disconnects, then frees dbc and env. Never
+    // raises, so every safe step is attempted; released handles are cleared, so a repeat is a no-op.
+    void releaseHandles(ServerInterface &srvInterface, std::vector<std::string> &errors) {
+        SQLRETURN r;
+        if (stmt != SQL_NULL_HSTMT) {
+            r = SQLFreeHandle(SQL_HANDLE_STMT, stmt);
+            noteCleanupResult(srvInterface, r, SQL_HANDLE_STMT, stmt, "SQLFreeHandle(SQL_HANDLE_STMT)", true, errors);
+            // A statement that failed to free stays owned by dbc; a successful SQLDisconnect() frees it.
+            if (SQL_SUCCEEDED(r) || r == SQL_INVALID_HANDLE) stmt = SQL_NULL_HSTMT;
+        }
+
+        if (dbc != SQL_NULL_HDBC && connected) {
+            // Fix for Issue #1. Commit before calling SQLDisconnect to avoid HY010 error.
+            std::string commit_state;
+            r = SQLEndTran(SQL_HANDLE_DBC, dbc, SQL_COMMIT);
+            noteCleanupResult(srvInterface, r, SQL_HANDLE_DBC, dbc, "SQLEndTran(SQL_COMMIT)", false, errors, &commit_state);
+            // One rollback attempt, so SQLDisconnect() is not refused for an open transaction;
+            // skipped when SQLSTATE class 08 says the connection itself is gone.
+            if (r == SQL_ERROR && commit_state.compare(0, 2, "08") != 0) {
+                SQLRETURN r_rollback = SQLEndTran(SQL_HANDLE_DBC, dbc, SQL_ROLLBACK);
+                noteCleanupResult(srvInterface, r_rollback, SQL_HANDLE_DBC, dbc,
+                                  "SQLEndTran(SQL_ROLLBACK) after the failed commit", false, errors);
+                if (SQL_SUCCEEDED(r_rollback)) {
+                    srvInterface.log("ODBC Loader: source transaction rolled back after the commit failed");
+                } else if (r_rollback == SQL_INVALID_HANDLE) {
+                    r = r_rollback;
+                }
+            }
+            if (r != SQL_INVALID_HANDLE) {
+                r = SQLDisconnect(dbc);
+                noteCleanupResult(srvInterface, r, SQL_HANDLE_DBC, dbc, "SQLDisconnect()", false, errors);
+            }
+            if (SQL_SUCCEEDED(r)) {
+                connected = false;
+                stmt = SQL_NULL_HSTMT;      // SQLDisconnect() frees any remaining statements
+            } else if (r == SQL_INVALID_HANDLE) {
+                // Nothing further can be done through an invalid handle; do not retry it.
+                dbc = SQL_NULL_HDBC;
+                stmt = SQL_NULL_HSTMT;
+                connected = false;
+            }
+        }
+
+        if (dbc != SQL_NULL_HDBC) {
+            if (connected) {
+                errors.push_back("SQLFreeHandle(SQL_HANDLE_DBC) skipped because the connection is still open");
+            } else {
+                r = SQLFreeHandle(SQL_HANDLE_DBC, dbc);
+                noteCleanupResult(srvInterface, r, SQL_HANDLE_DBC, dbc, "SQLFreeHandle(SQL_HANDLE_DBC)", true, errors);
+                if (SQL_SUCCEEDED(r) || r == SQL_INVALID_HANDLE) dbc = SQL_NULL_HDBC;
+            }
+        }
+
+        if (env != SQL_NULL_HENV) {
+            if (dbc != SQL_NULL_HDBC) {
+                errors.push_back("SQLFreeHandle(SQL_HANDLE_ENV) skipped because its connection handle is still allocated");
+            } else {
+                r = SQLFreeHandle(SQL_HANDLE_ENV, env);
+                noteCleanupResult(srvInterface, r, SQL_HANDLE_ENV, env, "SQLFreeHandle(SQL_HANDLE_ENV)", true, errors);
+                if (SQL_SUCCEEDED(r) || r == SQL_INVALID_HANDLE) env = SQL_NULL_HENV;
+            }
+        }
+    }
+
+    // The SDK does not document destroy() after setup() throws, so a failed setup() releases its
+    // handles here. Must not throw: the setup error already in flight is the one to report.
+    void releaseAfterSetupFailure(ServerInterface &srvInterface) {
+        try {
+            std::vector<std::string> errors;
+            releaseHandles(srvInterface, errors);
+            for (size_t k = 0; k < errors.size(); k++) {
+                srvInterface.log("ODBC Error during cleanup of a failed setup: %s", errors[k].c_str());
+            }
+        } catch (...) {
+            // Unreleased handles stay set, so a later destroy() can still retry them.
+        }
+    }
+
+    // Logs warnings that workers kept in their own slots. Call only after joinWorkers().
+    void reportWorkerWarnings(ServerInterface &srvInterface) {
+        for (size_t k = 0; k < workerStatus.size(); k++) {
+            for (size_t w = 0; w < workerStatus[k].warnings.size(); w++) {
+                srvInterface.log("ODBC Warning (worker %zu): %s", k, workerStatus[k].warnings[w].c_str());
+            }
+            workerStatus[k].warnings.clear();
+        }
+    }
+
 
 public:
 
@@ -882,6 +1092,7 @@ public:
             if (isCanceled()) {
                 canceledFlag.store(true);
                 joinWorkers();
+                reportWorkerWarnings(srvInterface);
                 return DONE;
             }
 
@@ -897,11 +1108,13 @@ public:
 
             // All workers finished and queue drained: join before returning.
             joinWorkers();
+            reportWorkerWarnings(srvInterface);    // logged first; never replaces a worker error
             if (anyWorkerFailed()) {
                 // Rows already emitted stay uncommitted: vt_report_error aborts the
                 // COPY and Vertica rolls the transaction back.
                 raiseWorkerError(srvInterface);
             }
+            loadCompleted = true;
             return DONE;
         }
 
@@ -956,21 +1169,34 @@ public:
             return KEEP_GOING;
         }
 
+        loadCompleted = true;
         return DONE;
     }           // End PROCESS
 
     void setQuirksMode(ServerInterface &srvInterface, SQLHDBC &dbc) {
         // Set the quirks mode based on the DB name
-        SQLSMALLINT len;
-        char buf[32];
-        memset(&buf[0], 0, 32);
+        SQLSMALLINT len = -1;
+        char buf[256];
+        memset(&buf[0], 0, sizeof(buf));
 
-        SQLGetInfo(dbc, SQL_SERVER_NAME, buf,
-                   sizeof(buf) - 1 /* leave a byte for null-termination */,
-                   &len);
-        srvInterface.log("ODBC Loader: Connecting to server of type '%s'", buf);
+        SQLRETURN r = SQLGetInfo(dbc, SQL_SERVER_NAME, buf,
+                                 (SQLSMALLINT)(sizeof(buf) - 1) /* leave a byte for null-termination */,
+                                 &len);
+        handleReturnCode(srvInterface, r, SQL_HANDLE_DBC, dbc, "SQLGetInfo(SQL_SERVER_NAME)");
+        if (len < 0) {
+            vt_report_error(0, "ODBC Error: SQLGetInfo(SQL_SERVER_NAME) returned invalid length %d", (int)len);
+        }
 
-        std::string db_type(buf, len);
+        // On truncation 'len' is the full name length, not what fits in buf.
+        std::string db_type;
+        if ((size_t)len >= sizeof(buf) - 1) {
+            db_type.assign(buf, strnlen(buf, sizeof(buf) - 1));
+            srvInterface.log("ODBC Loader: server name truncated to %zu of %d bytes", db_type.size(), (int)len);
+        } else {
+            db_type.assign(buf, (size_t)len);
+        }
+        srvInterface.log("ODBC Loader: Connecting to server of type '%s'", db_type.c_str());
+
         if (db_type == "ORCL") {
             quirks = Oracle;
         }
@@ -979,7 +1205,12 @@ public:
         // MariaDB reports its own DBMS name but shares MySQL's MOD() sign semantics.
         char dbms[64];
         memset(&dbms[0], 0, sizeof(dbms));
-        SQLGetInfo(dbc, SQL_DBMS_NAME, dbms, sizeof(dbms) - 1, NULL);
+        r = SQLGetInfo(dbc, SQL_DBMS_NAME, dbms, sizeof(dbms) - 1, NULL);
+        if (!SQL_SUCCEEDED(r)) {
+            srvInterface.log("ODBC Loader: %s; DBMS unknown, modulo split disabled",
+                             diagText(SQL_HANDLE_DBC, dbc, r, "SQLGetInfo(SQL_DBMS_NAME)").c_str());
+            dbms[0] = '\0';
+        }
         std::string dbms_name(dbms);
         for (size_t i = 0; i < dbms_name.size(); i++) {
             char c = dbms_name[i];
@@ -996,6 +1227,7 @@ public:
         colInfo = returnType;
         colInTable = (int)colInfo.getColumnCount() ;
         vidx.clear() ;
+        loadCompleted = false ;         // this load's outcome, read by destroy()
 		bool src_rfilter = true ;       // Rows filtering flag
         bool src_cfilter = true ;       // Column filtering flag
         bool oq_flag = false ;          // Query Ovverride flag
@@ -1157,6 +1389,12 @@ srvInterface.log("-----> External Table Columns, colInTable=<%d>", colInTable);
   srvInterface.log("DEBUG rowset=%zu", rowset);
 #endif
 
+        // Releases the handles acquired below if setup() raises; disarmed once it completes.
+        struct SetupFailureGuard {
+            ODBCLoader *self; ServerInterface *srv; bool armed;
+            ~SetupFailureGuard() { if (armed) self->releaseAfterSetupFailure(*srv); }
+        } setupGuard = { this, &srvInterface, true };
+
         // Establish an ODBC connection
         r = SQLAllocHandle(SQL_HANDLE_ENV, SQL_NULL_HANDLE, &env);
         handleReturnCode(srvInterface, r, SQL_HANDLE_ENV, env, "SQLAllocHandle()");
@@ -1169,6 +1407,7 @@ srvInterface.log("-----> External Table Columns, colInTable=<%d>", colInTable);
 
         r = SQLDriverConnect(dbc, NULL, (SQLCHAR*)connect.c_str(), SQL_NTS, NULL, 0, NULL, SQL_DRIVER_COMPLETE);
         handleReturnCode(srvInterface, r, SQL_HANDLE_DBC, dbc, "SQLDriverConnect()");
+        connected = true;
 
         // We have a connection; now we know enough to figure out
         // which DB we have to customize to
@@ -1177,17 +1416,14 @@ srvInterface.log("-----> External Table Columns, colInTable=<%d>", colInTable);
         r = SQLAllocHandle(SQL_HANDLE_STMT, dbc, &stmt);
         handleReturnCode(srvInterface, r, SQL_HANDLE_STMT, stmt, "SQLAllocHandle(SQL_HANDLE_STMT)");
 
-        // Set bind by column statement attribute:
-        r = SQLSetStmtAttr(stmt, SQL_ATTR_ROW_BIND_TYPE, (SQLPOINTER)SQL_BIND_BY_COLUMN, 0) ;
-        handleReturnCode(srvInterface, r, SQL_HANDLE_STMT, stmt, "SQLSetStmtAttr(SQL_ATTR_ROW_BIND_TYPE)");
-
-        // Set ROW_ARRAY_SIZE statement attribute:
-        r = SQLSetStmtAttr(stmt, SQL_ATTR_ROW_ARRAY_SIZE, (SQLPOINTER)rowset, 0) ;
-        handleReturnCode(srvInterface, r, SQL_HANDLE_STMT, stmt, "SQLSetStmtAttr(SQL_ATTR_ROW_ARRAY_SIZE)");
-
-        // Set ROWS_FETCHED_PTR statement attribute:
-        r = SQLSetStmtAttr(stmt, SQL_ATTR_ROWS_FETCHED_PTR, &nfrows, 0) ;
-        handleReturnCode(srvInterface, r, SQL_HANDLE_STMT, stmt, "SQLSetStmtAttr(SQL_ATTR_ROWS_FETCHED_PTR)");
+        // Column-wise binding, ROW_ARRAY_SIZE and ROWS_FETCHED_PTR; rejected or substituted values fail the load.
+        RowsetAttrResult attrs = setRowsetAttrs(stmt, (SQLULEN)rowset, &nfrows);
+        for (size_t k = 0; k < attrs.warnings.size(); k++) {
+            srvInterface.log("ODBC Warning: %s", attrs.warnings[k].c_str());
+        }
+        if (!attrs.ok) {
+            vt_report_error(0, "ODBC Error: %s", attrs.message.c_str());
+        }
 
         // Derive the split and run the first/only slice; unsplit path is unchanged.
         buildSliceQueries(srvInterface, query, (int)thread_count, split_column, split_method);
@@ -1245,25 +1481,28 @@ srvInterface.log("-----> External Table Columns, colInTable=<%d>", colInTable);
         if (threaded) {
             SQLFreeStmt(stmt, SQL_CLOSE);
         }
+        setupGuard.armed = false;
     }
 
     virtual void destroy(ServerInterface &srvInterface, SizedColumnTypes &returnType) {
         // Join before freeing handles; a joinable thread left at destruction terminates.
         joinWorkers();
+        reportWorkerWarnings(srvInterface);    // any not yet reported, e.g. after process() raised
 
-        // Fix for Issue #1. Commit before calling SQLDisconnect to avoid HY010 error.
-        SQLRETURN r_end_tran = SQLEndTran(SQL_HANDLE_DBC, dbc, SQL_COMMIT);
-        handleReturnCode(srvInterface, r_end_tran, SQL_HANDLE_DBC, dbc, "SQLEndTran()");
+        std::vector<std::string> errors;
+        releaseHandles(srvInterface, errors);
+        if (errors.empty()) return;
 
-        // Try to free even on error, to minimize the risk of memory leaks.
-        // But do check for errors in the end.
-        SQLRETURN r_disconnect = SQLDisconnect(dbc);
-        SQLRETURN r_free_dbc = SQLFreeHandle(SQL_HANDLE_DBC, dbc);
-        SQLRETURN r_free_env = SQLFreeHandle(SQL_HANDLE_ENV, env);
-
-        handleReturnCode(srvInterface, r_disconnect, SQL_HANDLE_DBC, dbc, "SQLDisconnect()");
-        handleReturnCode(srvInterface, r_free_dbc, SQL_HANDLE_DBC, dbc, "SQLFreeHandle(SQL_HANDLE_DBC)");
-        handleReturnCode(srvInterface, r_free_env, SQL_HANDLE_ENV, env, "SQLFreeHandle(SQL_HANDLE_ENV)");
+        // A failed or canceled load already has its own error; log cleanup failures beside it.
+        if (!loadCompleted || isCanceled()) {
+            for (size_t k = 0; k < errors.size(); k++) {
+                srvInterface.log("ODBC Error during cleanup of a failed or canceled load: %s", errors[k].c_str());
+            }
+            return;
+        }
+        std::string all = errors[0];
+        for (size_t k = 1; k < errors.size(); k++) all += "; " + errors[k];
+        vt_report_error(0, "ODBC Error during cleanup: %s", all.c_str());
     }
 };
 
