@@ -159,6 +159,8 @@ Threading = 0
 ```
 Without it the workers still produce correct results, just no concurrency. Make sure the driver is a thread-safe build first (see the MYSQL note under [Database Specific Notes](#database-specific-notes)).
 
+**Cancellation.** With parallel fetch the coordinating thread waits at most 100 ms for a batch before returning control to Vertica, so a cancel is noticed even while every worker is waiting on the remote database. On cancel, or when one worker fails, each worker's running statement is sent ``SQLCancel`` (re-sent every second until the worker exits), and every worker is joined before the load is rolled back. How quickly a blocked ``SQLExecDirect``/``SQLFetch`` returns depends on the driver: some drivers ignore or do not support cross-thread ``SQLCancel``, and unixODBC at the driver's ``Threading`` level 3 queues ``SQLCancel`` behind the running call (``Threading = 0`` above avoids this). Connecting cannot be canceled. Work done on the coordinating thread is not interrupted either; a cancel takes effect when it returns. That covers the single-connection fetch and, before workers start, the connection, the ``MIN``/``MAX`` split probe and the first run of slice 0 used for column metadata. No timeout is applied to the remote query.
+
 You can **switch predicate pushdown on/off** with the optional boolean parameter  ``src_rfilter``. The default value is true (meaning we perform predicate pushdown). You can set  ``src_rfilter``  either in the ``CREATE EXTERNAL TABLE`` statement or using a **SESSION PARAMETER** as follows:
 ```sql
 ALTER SESSION SET UDPARAMETER FOR ODBCLoaderLib src_rfilter = false ;

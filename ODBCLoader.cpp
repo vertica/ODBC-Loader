@@ -21,6 +21,8 @@
 #include <algorithm>
 #include <atomic>
 #include <stdexcept>
+#include <chrono>
+#include <memory>
 
 // To deal with TimeTz and TimestampTz.
 // No standard native-SQL representation for these,
@@ -43,6 +45,8 @@
 #define DEF_THREAD  1       // Default thread_count
 #define MAX_QUEUE_BATCHES 8 // Queue depth; bounds buffered rows at 8 x rowset
 #define BATCHES_PER_BREAK 4 // Batches per process() call, to keep cancel checks frequent
+#define CONSUMER_WAIT_MS 100 // Longest wait for a batch before process() yields to Vertica (not a query timeout)
+#define CANCEL_RETRY_MS 1000 // Interval for re-sending SQLCancel to workers that have not exited yet
 #define MAX_PRELEN  2048    // Max predicate length
 #define MAX_PRENUM  10      // Max predicate number
 #define REG_CASTRM  R"(::\w+(\([^()]*\))*)"
@@ -175,6 +179,18 @@ private:
         WorkerStatus() : failed(false) {}
     };
     std::vector<WorkerStatus> workerStatus;
+
+    // A worker's statement, published so the main thread can SQLCancel it. The worker
+    // unpublishes under mtx before freeing it, so a cancel never reaches a freed handle.
+    struct StmtSlot {
+        std::mutex mtx;
+        SQLHSTMT stmt;            // set only while the worker may execute or fetch on it
+        bool cancelRequested;     // abort requested for this worker by the main thread
+        bool cancelFailed;        // SQLCancel failed; not retried
+        std::string cancelDiag;   // reported by the main thread after join
+        StmtSlot() : stmt(SQL_NULL_HSTMT), cancelRequested(false), cancelFailed(false) {}
+    };
+    std::vector<std::unique_ptr<StmtSlot> > stmtSlots;  // sized before workers start, never while they run
 
     bool threaded;          // true when running the multi-worker path
     bool workersStarted;    // spawn workers only once across process() re-entry
@@ -826,6 +842,9 @@ private:
     // No lock: each worker writes only its own slot, read after joinWorkers().
     void captureWorkerError(int workerIdx, SQLSMALLINT handleType, SQLHANDLE handle,
                             const char *fnName) {
+        // Failures after an abort are the expected effect of SQLCancel; they must not displace
+        // the cancellation or the worker error that caused the abort.
+        if (abortRequested(workerIdx)) return;
         SQLCHAR state_rec[6] = {0};
         SQLINTEGER native_code = 0;
         SQLCHAR message_text[MAX_DIAG_MSG_TEXT_LENGTH] = {0};
@@ -838,6 +857,30 @@ private:
         std::ostringstream m;
         m << fnName << " failed [" << (char*)message_text << "] (native " << (int)native_code << ")";
         ws.message = m.str();
+    }
+
+    // True once the load is canceled or the main thread asked this worker to abort.
+    bool abortRequested(int workerIdx) {
+        if (canceledFlag.load()) return true;
+        StmtSlot &s = *stmtSlots[workerIdx];
+        std::lock_guard<std::mutex> g(s.mtx);
+        return s.cancelRequested;
+    }
+
+    // Makes the worker's statement reachable by SQLCancel; refuses once an abort was requested.
+    bool publishStmt(int workerIdx, SQLHSTMT h) {
+        StmtSlot &s = *stmtSlots[workerIdx];
+        std::lock_guard<std::mutex> g(s.mtx);
+        if (s.cancelRequested || canceledFlag.load()) return false;
+        s.stmt = h;
+        return true;
+    }
+
+    // Must precede freeing the statement; waits for any SQLCancel already using it.
+    void unpublishStmt(int workerIdx) {
+        StmtSlot &s = *stmtSlots[workerIdx];
+        std::lock_guard<std::mutex> g(s.mtx);
+        s.stmt = SQL_NULL_HSTMT;
     }
 
     // Worker entry point: owns its own env/dbc/stmt and buffers, and shares only
@@ -854,14 +897,16 @@ private:
         struct Cleanup {
             SQLHENV *e; SQLHDBC *d; SQLHSTMT *s;
             std::vector<SQLPOINTER> *rp; std::vector<SQLLEN*> *lp;
+            ODBCLoader *self; int idx;
             ~Cleanup() {
+                self->unpublishStmt(idx);   // no SQLCancel can reach the statement after this
                 for (size_t c = 0; rp && c < rp->size(); c++) free((*rp)[c]);
                 for (size_t c = 0; lp && c < lp->size(); c++) free((*lp)[c]);
                 if (s && *s != SQL_NULL_HSTMT) { SQLFreeStmt(*s, SQL_CLOSE); SQLFreeHandle(SQL_HANDLE_STMT, *s); }
                 if (d && *d != SQL_NULL_HDBC) { SQLDisconnect(*d); SQLFreeHandle(SQL_HANDLE_DBC, *d); }
                 if (e && *e != SQL_NULL_HENV) { SQLFreeHandle(SQL_HANDLE_ENV, *e); }
             }
-        } cleanup = { &wenv, &wdbc, &wstmt, &wresp, &wlenp };
+        } cleanup = { &wenv, &wdbc, &wstmt, &wresp, &wlenp, this, workerIdx };
 
         bool done = false;
         // unixODBC serializes connections unless the driver sets Threading = 0; see README.
@@ -871,6 +916,8 @@ private:
             captureWorkerError(workerIdx, SQL_HANDLE_ENV, wenv, "SQLAllocHandle(worker env/dbc)");
             done = true;
         }
+        // SQLDriverConnect cannot be canceled, so skip it once an abort is already known.
+        if (!done && abortRequested(workerIdx)) done = true;
         if (!done && !SQL_SUCCEEDED(SQLDriverConnect(wdbc, NULL, (SQLCHAR*)connect.c_str(),
                                                      SQL_NTS, NULL, 0, NULL, SQL_DRIVER_COMPLETE))) {
             captureWorkerError(workerIdx, SQL_HANDLE_DBC, wdbc, "SQLDriverConnect(worker)");
@@ -880,18 +927,20 @@ private:
             captureWorkerError(workerIdx, SQL_HANDLE_DBC, wdbc, "SQLAllocHandle(worker stmt)");
             done = true;
         }
+        if (!done && !publishStmt(workerIdx, wstmt)) done = true;   // abort requested meanwhile
         if (!done) {
             // Never execute or fetch with rowset settings the driver rejected or changed.
             RowsetAttrResult attrs = setRowsetAttrs(wstmt, (SQLULEN)rowset, &wnfrows);
             workerStatus[workerIdx].warnings = attrs.warnings;
-            if (!attrs.ok) {
+            if (!attrs.ok && !abortRequested(workerIdx)) {
                 WorkerStatus &ws = workerStatus[workerIdx];
                 ws.failed = true;
                 ws.sqlstate = attrs.sqlstate;
                 ws.message = attrs.message;
-                done = true;
             }
+            if (!attrs.ok) done = true;
         }
+        if (!done && abortRequested(workerIdx)) done = true;
         if (!done) {
             if (!SQL_SUCCEEDED(SQLExecDirect(wstmt, (SQLCHAR*)sliceQuery.c_str(), SQL_NTS))) {
                 captureWorkerError(workerIdx, SQL_HANDLE_STMT, wstmt, "SQLExecDirect(worker)");
@@ -912,7 +961,7 @@ private:
 
         SQLRETURN fetchRet = SQL_SUCCESS;
         while (!done && !workerStatus[workerIdx].failed) {
-            if (canceledFlag.load()) break;                     // US 5598915: prompt exit on cancel
+            if (abortRequested(workerIdx)) break;               // US 5598915: prompt exit on cancel/abort
             {
                 std::unique_lock<std::mutex> lk(queue.mtx);
                 if (queue.shutdown) break;
@@ -953,9 +1002,13 @@ private:
         }
 
         if (!done && !SQL_SUCCEEDED(fetchRet) && fetchRet != SQL_NO_DATA &&
-            !workerStatus[workerIdx].failed && !canceledFlag.load()) {
+            !workerStatus[workerIdx].failed) {
             captureWorkerError(workerIdx, SQL_HANDLE_STMT, wstmt, "SQLFetch(worker)");
         }
+
+        // Unpublish before counting this producer out, so the main thread's cancel loop
+        // only ever sees statements whose workers are still running.
+        unpublishStmt(workerIdx);
 
         // Last producer out must wake a consumer that is waiting on an empty queue.
         {
@@ -972,6 +1025,8 @@ private:
     void startWorkers() {
         int n = std::min({(int)sliceQueries.size(), threadCountParam, MAX_THREAD});
         workerStatus.assign(n, WorkerStatus());
+        stmtSlots.clear();
+        for (int k = 0; k < n; k++) stmtSlots.push_back(std::unique_ptr<StmtSlot>(new StmtSlot()));
         queue.activeProducers = n;
         queue.shutdown = false;
         for (int k = 0; k < n; k++) {
@@ -986,7 +1041,9 @@ private:
                     workerStatus[u].message = "worker thread creation failed";
                 }
                 queue.activeProducers -= (n - k);
+                queue.shutdown = true;      // the load is doomed: abort the workers already running
                 queue.notEmpty.notify_all();
+                queue.notFull.notify_all();
                 break;
             }
         }
@@ -1000,14 +1057,38 @@ private:
         queue.notEmpty.notify_all();
     }
 
-    // Joins ALL workers before returning; never detach(). Signals shutdown so a
-    // worker blocked on a full queue wakes and exits (no deadlock).
-    void joinWorkers() {
+    // Joins ALL workers before returning; never detach(). Signals shutdown so a worker blocked
+    // on a full queue wakes and exits. Only an abort cancels statements; normal completion does not.
+    void joinWorkers(bool abort) {
         requestShutdown();
+        if (abort) cancelWorkerStatements();
         for (size_t k = 0; k < workers.size(); k++) {
             if (workers[k].joinable()) workers[k].join();
         }
         workers.clear();
+    }
+
+    // SQLCancels published worker statements, repeating every CANCEL_RETRY_MS while producers remain
+    // (a cancel just before SQLExecDirect/SQLFetch starts interrupts nothing). Never limits the query.
+    void cancelWorkerStatements() {
+        std::unique_lock<std::mutex> lk(queue.mtx);
+        while (queue.activeProducers > 0) {
+            lk.unlock();    // never hold the queue lock across SQLCancel
+            for (size_t k = 0; k < stmtSlots.size(); k++) {
+                StmtSlot &s = *stmtSlots[k];
+                std::lock_guard<std::mutex> g(s.mtx);   // the worker cannot free s.stmt meanwhile
+                s.cancelRequested = true;
+                if (s.stmt == SQL_NULL_HSTMT || s.cancelFailed) continue;
+                SQLRETURN r = SQLCancel(s.stmt);
+                if (!SQL_SUCCEEDED(r)) {
+                    s.cancelFailed = true;
+                    s.cancelDiag = diagText(SQL_HANDLE_STMT, s.stmt, r, "SQLCancel()");
+                }
+            }
+            lk.lock();
+            queue.notEmpty.wait_for(lk, std::chrono::milliseconds(CANCEL_RETRY_MS),
+                                    [this]{ return queue.activeProducers <= 0; });
+        }
     }
 
     // Re-raises the lowest-indexed worker failure on the MAIN thread (US 5602339).
@@ -1128,6 +1209,22 @@ private:
             }
             workerStatus[k].warnings.clear();
         }
+        for (size_t k = 0; k < stmtSlots.size(); k++) {
+            StmtSlot &s = *stmtSlots[k];
+            std::lock_guard<std::mutex> g(s.mtx);
+            if (s.cancelDiag.empty()) continue;
+            srvInterface.log("ODBC Warning (worker %zu): cancellation not delivered, so the worker ran until its call returned: %s",
+                             k, s.cancelDiag.c_str());
+            s.cancelDiag.clear();
+        }
+    }
+
+    // Vertica canceled the load: stop and join every worker, then hand control back.
+    StreamState abortForCancel(ServerInterface &srvInterface) {
+        canceledFlag.store(true);
+        joinWorkers(true);
+        reportWorkerWarnings(srvInterface);
+        return DONE;
     }
 
 
@@ -1137,15 +1234,12 @@ public:
         // Threaded path: the main thread is the sole consumer. Emit a bounded number
         // of batches per call so the KEEP_GOING re-entry contract still holds.
         if (threaded) {
+            // Workers cannot call isCanceled(), so publish it for them here (US 5598915).
+            if (isCanceled()) return abortForCancel(srvInterface);
+
             if (!workersStarted) {
                 startWorkers();
                 workersStarted = true;
-            }
-
-            // Workers cannot call isCanceled(), so publish it for them here.
-            if (isCanceled()) {
-                canceledFlag.store(true);
-                requestShutdown();          // wake a worker blocked on a full queue
             }
 
             uint32 batches_emitted = 0;
@@ -1154,7 +1248,8 @@ public:
                 bool haveBatch = false;
                 {
                     std::unique_lock<std::mutex> lk(queue.mtx);
-                    queue.notEmpty.wait(lk, [this]{
+                    // Bounded so blocked workers cannot keep process() from yielding and seeing a cancel.
+                    queue.notEmpty.wait_for(lk, std::chrono::milliseconds(CONSUMER_WAIT_MS), [this]{
                         return !queue.items.empty() || queue.activeProducers == 0 || queue.shutdown;
                     });
                     if (!queue.items.empty()) {
@@ -1180,30 +1275,33 @@ public:
                     continue;
                 }
 
-                // Nothing queued: producers are finished, or we were asked to stop.
+                // Nothing queued: producers are finished, we were asked to stop, or the wait timed out.
                 break;
             }
 
             // Cancellation check while draining (US 5598915).
-            if (isCanceled()) {
-                canceledFlag.store(true);
-                joinWorkers();
-                reportWorkerWarnings(srvInterface);
-                return DONE;
-            }
+            if (isCanceled()) return abortForCancel(srvInterface);
 
             // Not done until ALL producers finished AND the queue is fully drained.
-            bool drainedAndDone;
+            bool drainedAndDone, workerAbort;
             {
                 std::unique_lock<std::mutex> lk(queue.mtx);
                 drainedAndDone = (queue.activeProducers == 0 && queue.items.empty());
+                workerAbort = queue.shutdown;   // only a failed or unstarted worker sets this during process()
+            }
+            // The load is doomed: cancel the remaining workers instead of draining rows that roll back.
+            if (workerAbort) {
+                joinWorkers(true);
+                reportWorkerWarnings(srvInterface);
+                raiseWorkerError(srvInterface);
+                vt_report_error(0, "ODBC Loader: parallel fetch stopped without a recorded worker error");
             }
             if (!drainedAndDone) {
                 return KEEP_GOING;
             }
 
             // All workers finished and queue drained: join before returning.
-            joinWorkers();
+            joinWorkers(false);
             reportWorkerWarnings(srvInterface);    // logged first; never replaces a worker error
             if (anyWorkerFailed()) {
                 // Rows already emitted stay uncommitted: vt_report_error aborts the
@@ -1585,7 +1683,8 @@ srvInterface.log("-----> External Table Columns, colInTable=<%d>", colInTable);
 
     virtual void destroy(ServerInterface &srvInterface, SizedColumnTypes &returnType) {
         // Join before freeing handles; a joinable thread left at destruction terminates.
-        joinWorkers();
+        // Workers still running here mean process() did not finish normally, so abort them.
+        joinWorkers(true);
         reportWorkerWarnings(srvInterface);    // any not yet reported, e.g. after process() raised
 
         std::vector<std::string> errors;

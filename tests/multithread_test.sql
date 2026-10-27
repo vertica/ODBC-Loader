@@ -123,6 +123,13 @@ SELECT id, name FROM public.mt_people ORDER BY id;
 COPY mt_target WITH SOURCE ODBCSource() PARSER ODBCLoader(connect='DSN=MySQL', query='SELECT i, ST_ASTEXT(ST_GEOMFROMTEXT(CASE WHEN i > 6 THEN ''oops'' ELSE ''POINT(1 1)'' END)) AS v FROM testdb.test_source;', thread_count=3, split_column='i');
 SELECT count(*) AS nrows FROM mt_target;
 
+-- Test 16b (VTA-119250): the same failure while another worker is still executing. Row 5
+-- holds slice 1 in a bounded SLEEP(5) when slice 2 fails, so the abort sends SQLCancel to a
+-- running statement. The original GIS error must still be reported, not the canceled worker's
+-- "interrupted" error, and nothing is loaded. Timing is not asserted here.
+COPY mt_target WITH SOURCE ODBCSource() PARSER ODBCLoader(connect='DSN=MySQL', query='SELECT i, ST_ASTEXT(ST_GEOMFROMTEXT(CASE WHEN i > 6 THEN ''oops'' WHEN i = 5 AND SLEEP(5) = 0 THEN ''POINT(5 5)'' ELSE ''POINT(1 1)'' END)) AS v FROM testdb.test_source;', thread_count=3, split_column='i');
+SELECT count(*) AS nrows FROM mt_target;
+
 -- Tests 17-28 are the regression guard for VTA-118933. Each fixture is built inline
 -- on the MySQL side and loaded four ways (single, default, range, modulo); all four
 -- must list every row. Listings are ordered by payload, since SUM over extreme keys
