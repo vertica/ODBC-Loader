@@ -273,6 +273,33 @@ SELECT count(*) AS nrows FROM mt_time;
 COPY mt_time WITH SOURCE ODBCSource() PARSER ODBCLoader(connect='DSN=MySQL', query='SELECT CAST(1 AS SIGNED) AS id, ''12:34:56'' AS t;');
 SELECT id, t FROM mt_time ORDER BY id;
 
+-- Tests 37-40 (PR #27 follow-up): each row carries the MySQL CONNECTION_ID() that produced it,
+-- so the split decision is observed from the connections actually used, not inferred from row counts.
+CREATE TABLE mt_conn (id NUMERIC(10,0), payload INT, conn_id INT);
+
+-- Test 37: whole-valued DECIMAL keys, thread_count=4, default split; must fall back to one connection
+COPY mt_conn WITH SOURCE ODBCSource() PARSER ODBCLoader(connect='DSN=MySQL', query='SELECT CAST(1 AS DECIMAL(10,0)) AS id, 1 AS payload, CAST(CONNECTION_ID() AS SIGNED) AS conn_id UNION ALL SELECT CAST(2 AS DECIMAL(10,0)), 2, CAST(CONNECTION_ID() AS SIGNED) UNION ALL SELECT CAST(3 AS DECIMAL(10,0)), 3, CAST(CONNECTION_ID() AS SIGNED) UNION ALL SELECT CAST(4 AS DECIMAL(10,0)), 4, CAST(CONNECTION_ID() AS SIGNED) UNION ALL SELECT CAST(5 AS DECIMAL(10,0)), 5, CAST(CONNECTION_ID() AS SIGNED) UNION ALL SELECT CAST(NULL AS DECIMAL(10,0)), 6, CAST(CONNECTION_ID() AS SIGNED);', thread_count=4, split_column='id');
+SELECT id, payload FROM mt_conn ORDER BY payload;
+SELECT count(*) AS nrows, count(conn_id) AS nn_conn, count(DISTINCT conn_id) = 1 AS one_conn FROM mt_conn;
+TRUNCATE TABLE mt_conn;
+
+-- Test 38: whole-valued DECIMAL keys, explicit range split; must fall back to one connection
+COPY mt_conn WITH SOURCE ODBCSource() PARSER ODBCLoader(connect='DSN=MySQL', query='SELECT CAST(1 AS DECIMAL(10,0)) AS id, 1 AS payload, CAST(CONNECTION_ID() AS SIGNED) AS conn_id UNION ALL SELECT CAST(2 AS DECIMAL(10,0)), 2, CAST(CONNECTION_ID() AS SIGNED) UNION ALL SELECT CAST(3 AS DECIMAL(10,0)), 3, CAST(CONNECTION_ID() AS SIGNED) UNION ALL SELECT CAST(4 AS DECIMAL(10,0)), 4, CAST(CONNECTION_ID() AS SIGNED) UNION ALL SELECT CAST(5 AS DECIMAL(10,0)), 5, CAST(CONNECTION_ID() AS SIGNED) UNION ALL SELECT CAST(NULL AS DECIMAL(10,0)), 6, CAST(CONNECTION_ID() AS SIGNED);', thread_count=4, split_column='id', split_method='range');
+SELECT id, payload FROM mt_conn ORDER BY payload;
+SELECT count(*) AS nrows, count(conn_id) AS nn_conn, count(DISTINCT conn_id) = 1 AS one_conn FROM mt_conn;
+TRUNCATE TABLE mt_conn;
+
+-- Test 39: whole-valued DECIMAL keys, modulo split; must fall back to one connection
+COPY mt_conn WITH SOURCE ODBCSource() PARSER ODBCLoader(connect='DSN=MySQL', query='SELECT CAST(1 AS DECIMAL(10,0)) AS id, 1 AS payload, CAST(CONNECTION_ID() AS SIGNED) AS conn_id UNION ALL SELECT CAST(2 AS DECIMAL(10,0)), 2, CAST(CONNECTION_ID() AS SIGNED) UNION ALL SELECT CAST(3 AS DECIMAL(10,0)), 3, CAST(CONNECTION_ID() AS SIGNED) UNION ALL SELECT CAST(4 AS DECIMAL(10,0)), 4, CAST(CONNECTION_ID() AS SIGNED) UNION ALL SELECT CAST(5 AS DECIMAL(10,0)), 5, CAST(CONNECTION_ID() AS SIGNED) UNION ALL SELECT CAST(NULL AS DECIMAL(10,0)), 6, CAST(CONNECTION_ID() AS SIGNED);', thread_count=4, split_column='id', split_method='modulo');
+SELECT id, payload FROM mt_conn ORDER BY payload;
+SELECT count(*) AS nrows, count(conn_id) AS nn_conn, count(DISTINCT conn_id) = 1 AS one_conn FROM mt_conn;
+TRUNCATE TABLE mt_conn;
+
+-- Test 40: positive control; native integer keys 1-6 over 3 range slices must use several connections
+COPY mt_conn WITH SOURCE ODBCSource() PARSER ODBCLoader(connect='DSN=MySQL', query='SELECT CAST(1 AS SIGNED) AS id, 1 AS payload, CAST(CONNECTION_ID() AS SIGNED) AS conn_id UNION ALL SELECT CAST(2 AS SIGNED), 2, CAST(CONNECTION_ID() AS SIGNED) UNION ALL SELECT CAST(3 AS SIGNED), 3, CAST(CONNECTION_ID() AS SIGNED) UNION ALL SELECT CAST(4 AS SIGNED), 4, CAST(CONNECTION_ID() AS SIGNED) UNION ALL SELECT CAST(5 AS SIGNED), 5, CAST(CONNECTION_ID() AS SIGNED) UNION ALL SELECT CAST(6 AS SIGNED), 6, CAST(CONNECTION_ID() AS SIGNED) UNION ALL SELECT CAST(NULL AS SIGNED), 7, CAST(CONNECTION_ID() AS SIGNED);', thread_count=3, split_column='id');
+SELECT id, payload FROM mt_conn ORDER BY payload;
+SELECT count(*) AS nrows, count(conn_id) AS nn_conn, count(DISTINCT conn_id) > 1 AS multi_conn FROM mt_conn;
+
 -- Clean up
 DROP TABLE public.mt_etime;
 DROP TABLE public.mt_people;
@@ -281,3 +308,4 @@ DROP TABLE mt_bigint;
 DROP TABLE mt_numeric;
 DROP TABLE mt_fraction;
 DROP TABLE mt_time;
+DROP TABLE mt_conn;
