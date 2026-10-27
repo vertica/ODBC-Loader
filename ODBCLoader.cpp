@@ -55,10 +55,6 @@
 
 using namespace Vertica;
 
-static inline TimeADT getTimeFromHMS(uint32 hour, uint8 min, uint8 sec) {
-    return getTimeFromUnixTime(sec + min*60 + hour*3600);
-}
-
 class ODBCLoader : public UDParser {
 public:
     ODBCLoader() : env(SQL_NULL_HENV), dbc(SQL_NULL_HDBC), stmt(SQL_NULL_HSTMT), connected(false),
@@ -147,7 +143,7 @@ private:
     // One column of one row, as raw driver bytes the main thread converts later.
     struct Cell {
         bool isNull;
-        SQLLEN lenIndicator;  // driver length indicator; any negative value stored as SQL_NTS
+        SQLLEN lenIndicator;  // driver length indicator; SQL_NO_TOTAL kept, other negatives stored as SQL_NTS
         std::string bytes;
         Cell() : isNull(true), lenIndicator(0) {}
     };
@@ -234,7 +230,7 @@ private:
         case CharOID:           return SQL_C_CHAR;
         case VarcharOID:        return SQL_C_CHAR;
         case DateOID:           return SQL_C_DATE;
-        case TimeOID:           return SQL_C_TIME;
+        case TimeOID:           return SQL_C_CHAR;  // SQL_TIME_STRUCT has no fractional seconds; parse the text instead
         case TimestampOID:      return SQL_C_TIMESTAMP;
         case TimestampTzOID:    return SQL_C_CHAR;  // Don't know how to deal with timezones in ODBC; just get them as a string and parse it
         case IntervalOID:       return SQL_C_INTERVAL_DAY_TO_SECOND;
@@ -283,10 +279,12 @@ private:
         // So just make something up; hope it's long enough.
         case TimestampTzOID: case TimeTzOID:
             return 80;
+
+        // "HH:MM:SS.fffffffff" plus NUL fits; longer text shows up as truncation and is rejected.
+        case TimeOID: return 32;
             
         // Everything struct-based needs to be the size of that struct
         case DateOID: return sizeof(DATE_STRUCT);
-        case TimeOID: return sizeof(TIME_STRUCT);
         case TimestampOID: return sizeof(TIMESTAMP_STRUCT);
         case IntervalOID: case IntervalYMOID: return sizeof(SQL_INTERVAL_STRUCT);
         
@@ -461,6 +459,41 @@ private:
         while (*end == ' ') end++;              // tolerate trailing spaces
         if (*end != '\0') return false;         // trailing junk -> not an integer
         out = v;
+        return true;
+    }
+
+    // Strict "HH:MM:SS[.fraction]" up to 24:00:00 (TimeADT is microseconds since midnight).
+    // Digits beyond the microsecond Vertica stores are rounded half-up, never truncated.
+    static bool parseTimeText(const char *s, size_t n, TimeADT &out) {
+        static const size_t digitPos[] = {0, 1, 3, 4, 6, 7};
+        if (n < 8 || s[2] != ':' || s[5] != ':') return false;
+        for (size_t k = 0; k < sizeof(digitPos) / sizeof(digitPos[0]); k++) {
+            if (s[digitPos[k]] < '0' || s[digitPos[k]] > '9') return false;
+        }
+        int hh = (s[0] - '0') * 10 + (s[1] - '0');
+        int mi = (s[3] - '0') * 10 + (s[4] - '0');
+        int ss = (s[6] - '0') * 10 + (s[7] - '0');
+        if (hh > 24 || mi > 59 || ss > 59) return false;
+
+        TimeADT us = 0;
+        bool nonzeroFraction = false;
+        if (n > 8) {
+            if (s[8] != '.' || n == 9) return false;
+            TimeADT scale = usPerSecond / 10;
+            bool roundUp = false;
+            for (size_t k = 9; k < n; k++) {
+                if (s[k] < '0' || s[k] > '9') return false;
+                if (s[k] != '0') nonzeroFraction = true;
+                if (scale > 0) { us += (s[k] - '0') * scale; scale /= 10; }
+                else if (k == 15) roundUp = (s[k] >= '5');
+            }
+            if (roundUp) us++;
+        }
+        // Hour 24 is only exactly 24:00:00, judged on the digits as supplied, before rounding.
+        if (hh == 24 && (mi != 0 || ss != 0 || nonzeroFraction)) return false;
+        TimeADT t = getTimeFromUnixTime((time_t)(hh * 3600 + mi * 60 + ss)) + us;
+        if (t > usPerDay) return false;
+        out = t;
         return true;
     }
 
@@ -696,8 +729,19 @@ private:
             break;
         }
         case TimeOID: {
-            SQL_TIME_STRUCT &s = *(SQL_TIME_STRUCT*)data.buf;
-            writer->setTime(vidx.at(i), getTimeFromHMS(s.hour, s.minute, s.second));
+            // Reject truncated text before reading it; SQL_NO_TOTAL means truncated, length unknown.
+            size_t cap = (size_t)stype[i];
+            size_t n = (data.len < 0) ? strnlen((char*)data.buf, cap) : (size_t)data.len;
+            if (data.len == SQL_NO_TOTAL || n >= cap) {
+                vt_report_error(0, "Error parsing Time: value truncated by the driver (length indicator %lld, buffer %zu bytes)",
+                                (long long)data.len, cap);
+            }
+            TimeADT t = 0;
+            if (!parseTimeText((const char*)data.buf, n, t)) {
+                vt_report_error(0, "Error parsing Time: '%.*s' (expected HH:MM:SS[.fraction] between 00:00:00 and 24:00:00)",
+                                (int)n, (char*)data.buf);
+            }
+            writer->setTime(vidx.at(i), t);
             break;
         }
         case TimestampOID: {
@@ -891,8 +935,8 @@ private:
                         size_t n = (len < 0) ? (size_t)stype[i] : (size_t)len;
                         if (n > (size_t)stype[i]) n = (size_t)stype[i];
                         row[i].bytes.assign((char*)wresp[i] + (size_t)stype[i]*j, n);
-                        // Any negative indicator is normalised to SQL_NTS so the consumer re-measures.
-                        row[i].lenIndicator = (len < 0) ? SQL_NTS : len;
+                        // SQL_NO_TOTAL (truncated) is kept so emitCell() can reject it; other negatives become SQL_NTS.
+                        row[i].lenIndicator = (len == SQL_NO_TOTAL) ? SQL_NO_TOTAL : ((len < 0) ? SQL_NTS : len);
                     }
                 }
                 batch.rows.push_back(std::move(row));

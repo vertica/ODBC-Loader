@@ -234,9 +234,43 @@ SELECT id, payload FROM mt_numeric ORDER BY payload;
 SELECT count(*) AS nrows FROM mt_numeric;
 TRUNCATE TABLE mt_numeric;
 
+-- Tests 33-35 (VTA-119249): TIME fractional seconds. The fixture is built inline as MySQL
+-- TIME(6), because testdb.test_source.t has no fractional precision. Keys are native integers.
+CREATE TABLE mt_time (id integer, t time(6));
+
+-- Test 33: single connection; rowset=4 fetches a full batch of 4 then a partial batch of 2
+COPY mt_time WITH SOURCE ODBCSource() PARSER ODBCLoader(connect='DSN=MySQL', query='SELECT CAST(1 AS SIGNED) AS id, CAST(''00:00:00'' AS TIME(6)) AS t UNION ALL SELECT CAST(2 AS SIGNED), CAST(''12:34:56'' AS TIME(6)) UNION ALL SELECT CAST(3 AS SIGNED), CAST(''12:34:56.123456'' AS TIME(6)) UNION ALL SELECT CAST(4 AS SIGNED), CAST(''23:59:59.999999'' AS TIME(6)) UNION ALL SELECT CAST(5 AS SIGNED), CAST(NULL AS TIME(6)) UNION ALL SELECT CAST(6 AS SIGNED), CAST(''00:00:00.000001'' AS TIME(6));', rowset=4);
+SELECT id, t, t IS NULL AS t_null FROM mt_time ORDER BY id;
+TRUNCATE TABLE mt_time;
+
+-- Test 34: range split of keys 1-6 over 2 workers; with rowset=2 each slice fetches 2 then a partial 1
+COPY mt_time WITH SOURCE ODBCSource() PARSER ODBCLoader(connect='DSN=MySQL', query='SELECT CAST(1 AS SIGNED) AS id, CAST(''00:00:00'' AS TIME(6)) AS t UNION ALL SELECT CAST(2 AS SIGNED), CAST(''12:34:56'' AS TIME(6)) UNION ALL SELECT CAST(3 AS SIGNED), CAST(''12:34:56.123456'' AS TIME(6)) UNION ALL SELECT CAST(4 AS SIGNED), CAST(''23:59:59.999999'' AS TIME(6)) UNION ALL SELECT CAST(5 AS SIGNED), CAST(NULL AS TIME(6)) UNION ALL SELECT CAST(6 AS SIGNED), CAST(''00:00:00.000001'' AS TIME(6));', thread_count=2, split_column='id', split_method='range', rowset=2);
+SELECT id, t, t IS NULL AS t_null FROM mt_time ORDER BY id;
+TRUNCATE TABLE mt_time;
+
+-- Test 35: External Table projecting only t, so fetched column 0 maps to target column 1
+CREATE EXTERNAL TABLE public.mt_etime (id integer, t time(6)) AS COPY WITH SOURCE ODBCSource() PARSER ODBCLoader(connect='DSN=MySQL', query='SELECT CAST(1 AS SIGNED) AS id, CAST(''00:00:00'' AS TIME(6)) AS t UNION ALL SELECT CAST(2 AS SIGNED), CAST(''12:34:56'' AS TIME(6)) UNION ALL SELECT CAST(3 AS SIGNED), CAST(''12:34:56.123456'' AS TIME(6)) UNION ALL SELECT CAST(4 AS SIGNED), CAST(''23:59:59.999999'' AS TIME(6)) UNION ALL SELECT CAST(5 AS SIGNED), CAST(NULL AS TIME(6)) UNION ALL SELECT CAST(6 AS SIGNED), CAST(''00:00:00.000001'' AS TIME(6));');
+SELECT t, t IS NULL AS t_null FROM public.mt_etime ORDER BY t_null, t;
+
+-- Test 36 (VTA-119249): parser rounding and the 24:00:00 boundary. The source returns text, not
+-- TIME(6), so MySQL cannot round these values before they reach the loader's TIME parser.
+COPY mt_time WITH SOURCE ODBCSource() PARSER ODBCLoader(connect='DSN=MySQL', query='SELECT CAST(1 AS SIGNED) AS id, ''12:34:56.1234564'' AS t UNION ALL SELECT CAST(2 AS SIGNED), ''12:34:56.1234565'' UNION ALL SELECT CAST(3 AS SIGNED), ''23:59:59.9999995'' UNION ALL SELECT CAST(4 AS SIGNED), ''24:00:00'' UNION ALL SELECT CAST(5 AS SIGNED), ''24:00:00.0000000'';');
+SELECT id, t FROM mt_time ORDER BY id;
+TRUNCATE TABLE mt_time;
+
+-- 24:00:00.0000001 would round to 24:00:00 but lies past it, so the load is rejected and rolled back
+COPY mt_time WITH SOURCE ODBCSource() PARSER ODBCLoader(connect='DSN=MySQL', query='SELECT CAST(1 AS SIGNED) AS id, ''12:34:56'' AS t UNION ALL SELECT CAST(2 AS SIGNED), ''24:00:00.0000001'';');
+SELECT count(*) AS nrows FROM mt_time;
+
+-- Same session afterwards: a valid text TIME loads normally
+COPY mt_time WITH SOURCE ODBCSource() PARSER ODBCLoader(connect='DSN=MySQL', query='SELECT CAST(1 AS SIGNED) AS id, ''12:34:56'' AS t;');
+SELECT id, t FROM mt_time ORDER BY id;
+
 -- Clean up
+DROP TABLE public.mt_etime;
 DROP TABLE public.mt_people;
 DROP TABLE mt_target;
 DROP TABLE mt_bigint;
 DROP TABLE mt_numeric;
 DROP TABLE mt_fraction;
+DROP TABLE mt_time;

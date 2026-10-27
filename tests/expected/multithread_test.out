@@ -505,6 +505,83 @@ TRUNCATE TABLE
 (1 row)
 
 TRUNCATE TABLE
+CREATE TABLE
+ Rows Loaded 
+-------------
+           6
+(1 row)
+
+ id |        t        | t_null 
+----+-----------------+--------
+  1 | 00:00:00        | f
+  2 | 12:34:56        | f
+  3 | 12:34:56.123456 | f
+  4 | 23:59:59.999999 | f
+  5 |                 | t
+  6 | 00:00:00.000001 | f
+(6 rows)
+
+TRUNCATE TABLE
+ Rows Loaded 
+-------------
+           6
+(1 row)
+
+ id |        t        | t_null 
+----+-----------------+--------
+  1 | 00:00:00        | f
+  2 | 12:34:56        | f
+  3 | 12:34:56.123456 | f
+  4 | 23:59:59.999999 | f
+  5 |                 | t
+  6 | 00:00:00.000001 | f
+(6 rows)
+
+TRUNCATE TABLE
+CREATE TABLE
+        t        | t_null 
+-----------------+--------
+ 00:00:00        | f
+ 00:00:00.000001 | f
+ 12:34:56        | f
+ 12:34:56.123456 | f
+ 23:59:59.999999 | f
+                 | t
+(6 rows)
+
+ Rows Loaded 
+-------------
+           5
+(1 row)
+
+ id |        t        
+----+-----------------
+  1 | 12:34:56.123456
+  2 | 12:34:56.123457
+  3 | 24:00:00
+  4 | 24:00:00
+  5 | 24:00:00
+(5 rows)
+
+TRUNCATE TABLE
+vsql: ERROR: Error parsing Time: '24:00:00.0000001' (...)
+ nrows 
+-------
+     0
+(1 row)
+
+ Rows Loaded 
+-------------
+           1
+(1 row)
+
+ id |    t     
+----+----------
+  1 | 12:34:56
+(1 row)
+
+DROP TABLE
+DROP TABLE
 DROP TABLE
 DROP TABLE
 DROP TABLE

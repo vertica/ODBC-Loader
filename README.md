@@ -54,6 +54,15 @@ This will cause Vertica to connect to the remote database identified by the give
 
 ``myverticatable`` must have the same number of columns as ``remote_table``.  The column types must also match up, or the ODBC driver for the remote database must be able to cast the column types to the Vertica types.  If necessary, you can always explicitly cast on the remote side by modifying the query, or on the local side with a Vertica COPY expression.
 
+``TIME`` values are fetched from the ODBC driver as text (``SQL_C_CHAR``). Fractional seconds are preserved when the driver supplies the complete value as ``HH:MM:SS[.fraction]``; digits beyond microseconds are rounded. Text that is incomplete, malformed or outside ``00:00:00``-``24:00:00`` (for example negative or over-24-hour ``TIME`` values) fails the load explicitly instead of silently losing precision.
+
+On our tested PostgreSQL setup with psqlODBC 10.03.0000, a native fractional ``TIME`` column fetched this way returned only the fractional suffix, so such loads now fail. The tested workaround is to return the value as text from the source query, keeping the Vertica target column as ``TIME(6)``:
+```sql
+SELECT id, CAST(time_column AS VARCHAR(32)) AS time_column
+FROM source_table;
+```
+With this source query, fractions and NULLs were preserved in both single-connection and threaded loads. Other source databases may need their own formatting to keep full precision and produce the ``HH:MM:SS[.fraction]`` format.
+
 The ``query`` argument to ODBCLoader can be any valid SQL query, or any other statement that the remote database will recognize and that will cause it to return a rowset.
 
 The ``connect`` argument to ODBCLoader can be any valid ODBC connect string.  It is common to configure /etc/odbc.ini and /etc/odbcinst.ini with all the necessary information, then simply reference the DSN listing in /etc/odbc.ini in each query.  For help configuring these files, or for more information on valid 'connect' strings, please see the documentation that came with the ODBC driver for the remote database product that you are connecting to, as the format of the string is specified by the driver.
