@@ -703,6 +703,36 @@ private:
         data.len = len;
         std::string rejectReason = "unrecognized syntax from remote database";
 
+        // Values read by length must fit the stored bytes; a truncated value is rejected, never shortened.
+        const char *byLength = NULL;
+        switch (vtype[i]) {
+        case CharOID:        byLength = "Char"; break;
+        case VarcharOID:     byLength = "Varchar"; break;
+        case BinaryOID:      byLength = "Binary"; break;
+        case VarbinaryOID:   byLength = "Varbinary"; break;
+#ifndef NO_LONG_OIDS
+        case LongVarcharOID:   byLength = "Long Varchar"; break;
+        case LongVarbinaryOID: byLength = "Long Varbinary"; break;
+#endif
+        case TimeOID:        byLength = "Time"; break;
+        case TimeTzOID:      byLength = "TimeTz"; break;
+        case TimestampTzOID: byLength = "TimestampTz"; break;
+        case NumericOID:     byLength = "Numeric"; break;
+        default: break;
+        }
+        if (byLength) {
+            size_t cap = (size_t)stype[i];
+            bool truncated = (data.len == SQL_NO_TOTAL) ||
+                (data.len >= 0 && (ctype[i] == SQL_C_CHAR ? (size_t)data.len >= cap : (size_t)data.len > cap));
+            if (truncated) {
+                vt_report_error(0, "Error parsing %s in column %d: value truncated by the driver (length indicator %lld, buffer %zu bytes)",
+                                byLength, vidx.at(i) + 1, (long long)data.len, cap);
+            }
+            if (data.len < 0) {
+                data.len = strnlen((char*)data.buf, cap);
+            }
+        }
+
         switch (vtype[i]) {
 
             // Simple fixed-length types
@@ -728,11 +758,6 @@ private:
 #ifndef NO_LONG_OIDS
         case LongVarcharOID: case LongVarbinaryOID:
 #endif
-            // Any negative length means the driver gave us none (SQL_NTS/SQL_NO_TOTAL);
-            // testing the sign also fixes a latent bug in the single-connection path.
-            if (data.len < 0) {
-                data.len = strnlen((char*)data.buf, getFieldSizeForCol(vidx.at(i)));
-            }
             writer->getStringRef(vidx.at(i)).copy((char*)data.buf, data.len);
             break;
 

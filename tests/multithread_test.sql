@@ -300,6 +300,16 @@ COPY mt_conn WITH SOURCE ODBCSource() PARSER ODBCLoader(connect='DSN=MySQL', que
 SELECT id, payload FROM mt_conn ORDER BY payload;
 SELECT count(*) AS nrows, count(conn_id) AS nn_conn, count(DISTINCT conn_id) > 1 AS multi_conn FROM mt_conn;
 
+-- Test 41: a 200-character numeric string overflows the 128-byte NUMERIC fetch buffer; it must be
+-- rejected as truncated, not parsed from a shortened value, on both loading paths
+COPY mt_numeric WITH SOURCE ODBCSource() PARSER ODBCLoader(connect='DSN=MySQL', query='SELECT REPEAT(''9'', 200) AS id, CAST(1 AS SIGNED) AS payload UNION ALL SELECT ''2'', CAST(2 AS SIGNED) UNION ALL SELECT ''3'', CAST(3 AS SIGNED) UNION ALL SELECT ''4'', CAST(4 AS SIGNED);');
+COPY mt_numeric WITH SOURCE ODBCSource() PARSER ODBCLoader(connect='DSN=MySQL', query='SELECT REPEAT(''9'', 200) AS id, CAST(1 AS SIGNED) AS payload UNION ALL SELECT ''2'', CAST(2 AS SIGNED) UNION ALL SELECT ''3'', CAST(3 AS SIGNED) UNION ALL SELECT ''4'', CAST(4 AS SIGNED);', thread_count=2, split_column='payload');
+SELECT count(*) AS nrows FROM mt_numeric;
+
+-- Test 42: the same shape with values that fit still loads in the same session
+COPY mt_numeric WITH SOURCE ODBCSource() PARSER ODBCLoader(connect='DSN=MySQL', query='SELECT ''1'' AS id, CAST(1 AS SIGNED) AS payload UNION ALL SELECT ''2'', CAST(2 AS SIGNED) UNION ALL SELECT ''3'', CAST(3 AS SIGNED) UNION ALL SELECT ''4'', CAST(4 AS SIGNED);', thread_count=2, split_column='payload');
+SELECT id, payload FROM mt_numeric ORDER BY payload;
+
 -- Clean up
 DROP TABLE public.mt_etime;
 DROP TABLE public.mt_people;

@@ -671,6 +671,26 @@ TRUNCATE TABLE
      7 |       7 | t
 (1 row)
 
+vsql: ERROR: Error parsing Numeric in column 1: value truncated by the driver (...)
+vsql: ERROR: Error parsing Numeric in column 1: value truncated by the driver (...)
+ nrows 
+-------
+     0
+(1 row)
+
+ Rows Loaded 
+-------------
+           4
+(1 row)
+
+ id | payload 
+----+---------
+  1 |       1
+  2 |       2
+  3 |       3
+  4 |       4
+(4 rows)
+
 DROP TABLE
 DROP TABLE
 DROP TABLE
