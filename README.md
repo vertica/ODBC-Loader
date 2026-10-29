@@ -54,6 +54,15 @@ This will cause Vertica to connect to the remote database identified by the give
 
 ``myverticatable`` must have the same number of columns as ``remote_table``.  The column types must also match up, or the ODBC driver for the remote database must be able to cast the column types to the Vertica types.  If necessary, you can always explicitly cast on the remote side by modifying the query, or on the local side with a Vertica COPY expression.
 
+``TIME`` values are fetched from the ODBC driver as text (``SQL_C_CHAR``). Fractional seconds are preserved when the driver supplies the complete value as ``HH:MM:SS[.fraction]``; digits beyond microseconds are rounded. Text that is incomplete, malformed or outside ``00:00:00``-``24:00:00`` (for example negative or over-24-hour ``TIME`` values) fails the load explicitly instead of silently losing precision.
+
+On our tested PostgreSQL setup with psqlODBC 10.03.0000, a native fractional ``TIME`` column fetched this way returned only the fractional suffix, so such loads now fail. The tested workaround is to return the value as text from the source query, keeping the Vertica target column as ``TIME(6)``:
+```sql
+SELECT id, CAST(time_column AS VARCHAR(32)) AS time_column
+FROM source_table;
+```
+With this source query, fractions and NULLs were preserved in both single-connection and threaded loads. Other source databases may need their own formatting to keep full precision and produce the ``HH:MM:SS[.fraction]`` format.
+
 The ``query`` argument to ODBCLoader can be any valid SQL query, or any other statement that the remote database will recognize and that will cause it to return a rowset.
 
 The ``connect`` argument to ODBCLoader can be any valid ODBC connect string.  It is common to configure /etc/odbc.ini and /etc/odbcinst.ini with all the necessary information, then simply reference the DSN listing in /etc/odbc.ini in each query.  For help configuring these files, or for more information on valid 'connect' strings, please see the documentation that came with the ODBC driver for the remote database product that you are connecting to, as the format of the string is specified by the driver.
@@ -113,7 +122,7 @@ CREATE  EXTERNAL  TABLE  public.epeople(
         rowset = 500
 ) ;
 ```
-Please consider that increasing this parameter will also increase the memory consumption of the ODBCLoader.
+Please consider that increasing this parameter will also increase the memory consumption of the ODBCLoader. If the ODBC driver rejects ``rowset`` or substitutes a different array size, the load fails rather than fetching with a size the buffers were not allocated for.
 
 ### Parallel fetch
 By default the ODBCLoader opens one connection to the remote database and fetches the result set serially. If the remote query has an **integer** column with a reasonably even spread, you can split it into slices and fetch them concurrently, each slice on its own ODBC connection:
@@ -122,7 +131,7 @@ By default the ODBCLoader opens one connection to the remote database and fetche
 | --- 			| --- 		| --- 		|
 | ``thread_count`` 	| 1 		| Number of slices/worker threads, 1..64. 1 keeps the original single-connection behaviour. |
 | ``split_column`` 	| *(none)* 	| Bare (unquoted) name of the integer column to split on. Required; without it ``thread_count`` is ignored. |
-| ``split_method`` 	| ``range`` 	| ``range`` splits the ``MIN``/``MAX`` span into contiguous ``BETWEEN`` chunks. ``modulo`` uses ``MOD()``, which spreads skewed keys more evenly but is only used on engines known to support ``MOD()`` (PostgreSQL, Oracle, MySQL, MariaDB); elsewhere it degrades to ``range``. |
+| ``split_method`` 	| ``range`` 	| ``range`` splits the ``MIN``/``MAX`` span into contiguous ``BETWEEN`` chunks. ``modulo`` uses ``MOD()``, which spreads skewed keys more evenly but is only used on engines known to support ``MOD()`` (PostgreSQL, Oracle, MySQL, MariaDB); elsewhere it degrades to ``range``. Case-insensitive; any other value is rejected, even when no split takes place. |
 
 ```sql
 CREATE  EXTERNAL  TABLE  public.epeople(
@@ -149,6 +158,8 @@ Driver=/usr/lib64/libmyodbc8w.so
 Threading = 0
 ```
 Without it the workers still produce correct results, just no concurrency. Make sure the driver is a thread-safe build first (see the MYSQL note under [Database Specific Notes](#database-specific-notes)).
+
+**Cancellation.** With parallel fetch the coordinating thread waits at most 100 ms for a batch before returning control to Vertica, so a cancel is noticed even while every worker is waiting on the remote database. On cancel, or when one worker fails, each worker's running statement is sent ``SQLCancel``, and every worker is joined before the load is rolled back. While workers remain, the request is repeated at roughly one-second intervals for each worker whose previous ``SQLCancel`` succeeded; a failed ``SQLCancel`` is recorded, logged after that worker is joined, and not retried for that worker. How quickly a blocked ``SQLExecDirect``/``SQLFetch`` returns depends on the driver: some drivers ignore or do not support cross-thread ``SQLCancel``, and unixODBC at the driver's ``Threading`` level 3 queues ``SQLCancel`` behind the running call (``Threading = 0`` above avoids this). Connecting cannot be canceled. Work done on the coordinating thread is not interrupted either; a cancel takes effect when it returns. That covers the single-connection fetch and, before workers start, the connection, the ``MIN``/``MAX`` split probe and the first run of slice 0 used for column metadata. No timeout is applied to the remote query.
 
 You can **switch predicate pushdown on/off** with the optional boolean parameter  ``src_rfilter``. The default value is true (meaning we perform predicate pushdown). You can set  ``src_rfilter``  either in the ``CREATE EXTERNAL TABLE`` statement or using a **SESSION PARAMETER** as follows:
 ```sql
@@ -187,7 +198,7 @@ When pushing predicates down to the external database, ODBCLoader performs the f
 3. ``ANY(ARRAY)`` will be converted to ``IN()``. For example ``ID = ANY(ARRAY[1,2,3])`` will be converted to ``ID IN(1,2,3)``
 
 ### Database Specific Notes
-**ORACLE**.  All integers in Vertica are 64-bit integers.  Oracle doesn't support 64-bit integers; their ODBC driver can't even cast to them on request.  This code contains a quirk/workaround for Oracle that retrieves integers as C strings and re-parses them.  However, the quirk doesn't reliably detect Oracle database servers right now. You can force Oracle with an obvious modification to the setQuirksMode() function in ODBCLoader.cpp.  If you know of a more-reliable way to detect Oracle, or a better workaround, patches welcome :-)                                                                              
+**ORACLE**.  All integers in Vertica are 64-bit integers.  Oracle doesn't support 64-bit integers; their ODBC driver can't even cast to them on request.  This code contains a quirk/workaround for Oracle that retrieves integers as C strings and re-parses them.  However, the quirk doesn't reliably detect Oracle database servers right now. The server type comes from ``SQLGetInfo(SQL_SERVER_NAME)``; if the driver cannot report it, the load fails with the driver's diagnostics. You can force Oracle with an obvious modification to the setQuirksMode() function in ODBCLoader.cpp.  If you know of a more-reliable way to detect Oracle, or a better workaround, patches welcome :-)                                                                              
 
 **MYSQL**. The MySQL ODBC driver comes in both a thread-safe and thread-unsafe build and configuration. The thread-unsafe version is KNOWN TO CRASH VERTICA if used in multiple COPY statements concurrently! (Vertica is, after all, highly multithreaded). Linux distributions aren't consistently careful to package thread-safe defaults. So if you're connecting to MySQL, be very careful to set up a thread-safe configuration.
 

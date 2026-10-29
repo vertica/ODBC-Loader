@@ -20,6 +20,9 @@
 #include <deque>
 #include <algorithm>
 #include <atomic>
+#include <stdexcept>
+#include <chrono>
+#include <memory>
 
 // To deal with TimeTz and TimestampTz.
 // No standard native-SQL representation for these,
@@ -42,6 +45,8 @@
 #define DEF_THREAD  1       // Default thread_count
 #define MAX_QUEUE_BATCHES 8 // Queue depth; bounds buffered rows at 8 x rowset
 #define BATCHES_PER_BREAK 4 // Batches per process() call, to keep cancel checks frequent
+#define CONSUMER_WAIT_MS 100 // Longest wait for a batch before process() yields to Vertica (not a query timeout)
+#define CANCEL_RETRY_MS 1000 // Interval for re-sending SQLCancel to workers that have not exited yet
 #define MAX_PRELEN  2048    // Max predicate length
 #define MAX_PRENUM  10      // Max predicate number
 #define REG_CASTRM  R"(::\w+(\([^()]*\))*)"
@@ -54,15 +59,12 @@
 
 using namespace Vertica;
 
-static inline TimeADT getTimeFromHMS(uint32 hour, uint8 min, uint8 sec) {
-    return getTimeFromUnixTime(sec + min*60 + hour*3600);
-}
-
 class ODBCLoader : public UDParser {
 public:
-    ODBCLoader() : colInTable(0), currentSlice(0), quirks(NoQuirks), modSupported(false),
+    ODBCLoader() : env(SQL_NULL_HENV), dbc(SQL_NULL_HDBC), stmt(SQL_NULL_HSTMT), connected(false),
+                   colInTable(0), currentSlice(0), quirks(NoQuirks), modSupported(false),
                    threaded(false), workersStarted(false), threadCountParam(DEF_THREAD),
-                   canceledFlag(false) {}
+                   canceledFlag(false), loadCompleted(false) {}
 
     // Maximum length of diagnostic-message text
     // that we can receive from the ODBC driver.
@@ -93,6 +95,7 @@ private:
     SQLHENV env;
     SQLHDBC dbc;
     SQLHSTMT stmt;
+    bool connected;             // from a successful SQLDriverConnect() until a successful SQLDisconnect()
     SQLSMALLINT numcols;
     SQLULEN nfrows;		// Number of fetched rows
     size_t rowset;
@@ -144,7 +147,7 @@ private:
     // One column of one row, as raw driver bytes the main thread converts later.
     struct Cell {
         bool isNull;
-        SQLLEN lenIndicator;  // driver length indicator; any negative value stored as SQL_NTS
+        SQLLEN lenIndicator;  // driver length indicator; SQL_NO_TOTAL kept, other negatives stored as SQL_NTS
         std::string bytes;
         Cell() : isNull(true), lenIndicator(0) {}
     };
@@ -172,9 +175,22 @@ private:
         bool failed;
         std::string message;    // driver message
         std::string sqlstate;   // SQLSTATE
+        std::vector<std::string> warnings;  // accepted driver warnings; logged by the main thread after join
         WorkerStatus() : failed(false) {}
     };
     std::vector<WorkerStatus> workerStatus;
+
+    // A worker's statement, published so the main thread can SQLCancel it. The worker
+    // unpublishes under mtx before freeing it, so a cancel never reaches a freed handle.
+    struct StmtSlot {
+        std::mutex mtx;
+        SQLHSTMT stmt;            // set only while the worker may execute or fetch on it
+        bool cancelRequested;     // abort requested for this worker by the main thread
+        bool cancelFailed;        // SQLCancel failed; not retried
+        std::string cancelDiag;   // reported by the main thread after join
+        StmtSlot() : stmt(SQL_NULL_HSTMT), cancelRequested(false), cancelFailed(false) {}
+    };
+    std::vector<std::unique_ptr<StmtSlot> > stmtSlots;  // sized before workers start, never while they run
 
     bool threaded;          // true when running the multi-worker path
     bool workersStarted;    // spawn workers only once across process() re-entry
@@ -182,6 +198,9 @@ private:
 
     // Published by the main thread; workers must not call the SDK's isCanceled().
     std::atomic<bool> canceledFlag;
+
+    // Set only when process() delivered every row; otherwise destroy() must not hide the primary error.
+    bool loadCompleted;
 
     // Gets the Vertica type of the specified column
     VerticaType getVerticaTypeOfCol(SQLSMALLINT colnum) {
@@ -227,7 +246,7 @@ private:
         case CharOID:           return SQL_C_CHAR;
         case VarcharOID:        return SQL_C_CHAR;
         case DateOID:           return SQL_C_DATE;
-        case TimeOID:           return SQL_C_TIME;
+        case TimeOID:           return SQL_C_CHAR;  // SQL_TIME_STRUCT has no fractional seconds; parse the text instead
         case TimestampOID:      return SQL_C_TIMESTAMP;
         case TimestampTzOID:    return SQL_C_CHAR;  // Don't know how to deal with timezones in ODBC; just get them as a string and parse it
         case IntervalOID:       return SQL_C_INTERVAL_DAY_TO_SECOND;
@@ -276,10 +295,12 @@ private:
         // So just make something up; hope it's long enough.
         case TimestampTzOID: case TimeTzOID:
             return 80;
+
+        // "HH:MM:SS.fffffffff" plus NUL fits; longer text shows up as truncation and is rejected.
+        case TimeOID: return 32;
             
         // Everything struct-based needs to be the size of that struct
         case DateOID: return sizeof(DATE_STRUCT);
-        case TimeOID: return sizeof(TIME_STRUCT);
         case TimestampOID: return sizeof(TIMESTAMP_STRUCT);
         case IntervalOID: case IntervalYMOID: return sizeof(SQL_INTERVAL_STRUCT);
         
@@ -348,6 +369,99 @@ private:
         }
     }
 
+    // Formats the first diagnostic record like handleReturnCode() but never raises.
+    // Call it before any later ODBC call on the same handle replaces the record.
+    static std::string diagText(SQLSMALLINT handle_type, SQLHANDLE handle, SQLRETURN r,
+                                const char *fn_name, std::string *sqlstate = NULL) {
+        std::ostringstream m;
+        if (r == SQL_INVALID_HANDLE) {
+            m << fn_name << " failed with internal error SQL_INVALID_HANDLE";
+            return m.str();
+        }
+        SQLCHAR state_rec[6] = {0};
+        SQLINTEGER native_code = 0;
+        SQLCHAR message_text[MAX_DIAG_MSG_TEXT_LENGTH] = {0};
+        SQLSMALLINT msg_length = 0;
+        SQLRETURN r_diag = SQLGetDiagRec(handle_type, handle, 1, &state_rec[0], &native_code,
+                                         &message_text[0], MAX_DIAG_MSG_TEXT_LENGTH, &msg_length);
+        m << fn_name << (r == SQL_SUCCESS_WITH_INFO ? " emitted a warning" : " failed");
+        if (!SQL_SUCCEEDED(r_diag)) {
+            m << " with return code " << (int)r << " (no diagnostic record available)";
+            return m.str();
+        }
+        if (sqlstate) *sqlstate = (char*)state_rec;
+        m << " with error code " << (char*)state_rec << ", native code " << (int)native_code
+          << " [" << (char*)message_text
+          << (msg_length >= (SQLSMALLINT)MAX_DIAG_MSG_TEXT_LENGTH ? "... (message truncated)" : "") << "]";
+        return m.str();
+    }
+
+    struct RowsetAttrResult {
+        bool ok;
+        std::string message;                // failure description, including diagnostics
+        std::string sqlstate;
+        std::vector<std::string> warnings;  // accepted SQL_SUCCESS_WITH_INFO diagnostics
+        RowsetAttrResult() : ok(true) {}
+    };
+
+    // Applies column-wise binding, the rowset size and the rows-fetched pointer. Fetch buffers
+    // are sized for exactly these values, so a rejected or substituted value fails the step.
+    // Never raises and never touches the SDK, so worker threads may call it.
+    static RowsetAttrResult setRowsetAttrs(SQLHSTMT h, SQLULEN rows, SQLULEN *fetched) {
+        struct Step { SQLINTEGER attr; SQLPOINTER value; SQLULEN number; const char *fn_name; };
+        const Step steps[] = {
+            { SQL_ATTR_ROW_BIND_TYPE,    (SQLPOINTER)SQL_BIND_BY_COLUMN, SQL_BIND_BY_COLUMN, "SQLSetStmtAttr(SQL_ATTR_ROW_BIND_TYPE)" },
+            { SQL_ATTR_ROW_ARRAY_SIZE,   (SQLPOINTER)rows,               rows,               "SQLSetStmtAttr(SQL_ATTR_ROW_ARRAY_SIZE)" },
+            { SQL_ATTR_ROWS_FETCHED_PTR, (SQLPOINTER)fetched,            0,                  "SQLSetStmtAttr(SQL_ATTR_ROWS_FETCHED_PTR)" },
+        };
+        RowsetAttrResult res;
+        for (size_t k = 0; k < sizeof(steps) / sizeof(steps[0]); k++) {
+            const Step &s = steps[k];
+            SQLRETURN r = SQLSetStmtAttr(h, s.attr, s.value, 0);
+            if (r == SQL_SUCCESS) continue;
+            std::string state;
+            std::string text = diagText(SQL_HANDLE_STMT, h, r, s.fn_name, &state);
+            if (r != SQL_SUCCESS_WITH_INFO) {
+                res.ok = false;
+                res.message = text;
+                res.sqlstate = state;
+                return res;
+            }
+
+            // A warning may mean the driver substituted another value (01S02); read back what it uses.
+            bool same = false;
+            std::ostringstream mismatch;
+            SQLRETURN rg;
+            if (s.attr == SQL_ATTR_ROWS_FETCHED_PTR) {
+                SQLULEN *actual = NULL;
+                rg = SQLGetStmtAttr(h, s.attr, &actual, SQL_IS_POINTER, NULL);
+                same = (actual == fetched);
+                mismatch << "the driver did not keep the requested rows-fetched pointer";
+            } else {
+                SQLULEN actual = 0;
+                rg = SQLGetStmtAttr(h, s.attr, &actual, 0, NULL);
+                same = (actual == s.number);
+                mismatch << "the driver uses " << (unsigned long long)actual
+                         << " instead of the requested " << (unsigned long long)s.number;
+            }
+            if (!SQL_SUCCEEDED(rg)) {
+                res.ok = false;
+                res.message = text + "; " + diagText(SQL_HANDLE_STMT, h, rg, "SQLGetStmtAttr()") +
+                              ", so the value in effect is unknown";
+                res.sqlstate = state;
+                return res;
+            }
+            if (!same) {
+                res.ok = false;
+                res.message = text + "; " + mismatch.str();
+                res.sqlstate = state;
+                return res;
+            }
+            res.warnings.push_back(text);
+        }
+        return res;
+    }
+
     // Strict base-10 parse; rejects non-integer input (text, dates, decimals).
     static bool parseWholeInteger(const char *s, long long &out) {
         if (s == NULL) return false;
@@ -362,6 +476,92 @@ private:
         if (*end != '\0') return false;         // trailing junk -> not an integer
         out = v;
         return true;
+    }
+
+    // Strict "HH:MM:SS[.fraction]" up to 24:00:00 (TimeADT is microseconds since midnight).
+    // Digits beyond the microsecond Vertica stores are rounded half-up, never truncated.
+    static bool parseTimeText(const char *s, size_t n, TimeADT &out) {
+        static const size_t digitPos[] = {0, 1, 3, 4, 6, 7};
+        if (n < 8 || s[2] != ':' || s[5] != ':') return false;
+        for (size_t k = 0; k < sizeof(digitPos) / sizeof(digitPos[0]); k++) {
+            if (s[digitPos[k]] < '0' || s[digitPos[k]] > '9') return false;
+        }
+        int hh = (s[0] - '0') * 10 + (s[1] - '0');
+        int mi = (s[3] - '0') * 10 + (s[4] - '0');
+        int ss = (s[6] - '0') * 10 + (s[7] - '0');
+        if (hh > 24 || mi > 59 || ss > 59) return false;
+
+        TimeADT us = 0;
+        bool nonzeroFraction = false;
+        if (n > 8) {
+            if (s[8] != '.' || n == 9) return false;
+            TimeADT scale = usPerSecond / 10;
+            bool roundUp = false;
+            for (size_t k = 9; k < n; k++) {
+                if (s[k] < '0' || s[k] > '9') return false;
+                if (s[k] != '0') nonzeroFraction = true;
+                if (scale > 0) { us += (s[k] - '0') * scale; scale /= 10; }
+                else if (k == 15) roundUp = (s[k] >= '5');
+            }
+            if (roundUp) us++;
+        }
+        // Hour 24 is only exactly 24:00:00, judged on the digits as supplied, before rounding.
+        if (hh == 24 && (mi != 0 || ss != 0 || nonzeroFraction)) return false;
+        TimeADT t = getTimeFromUnixTime((time_t)(hh * 3600 + mi * 60 + ss)) + us;
+        if (t > usPerDay) return false;
+        out = t;
+        return true;
+    }
+
+    // Parses the SDK-generated __query_col_idx__ list (e.g. "0,2,5"); blanks around a token are
+    // tolerated, anything else that is not a complete in-bounds index fails with 'err' set.
+    static bool parseColumnIndexList(const std::string &list, int targetCols,
+                                     std::vector<int> &out, std::string &err) {
+        out.clear();
+        size_t start = 0;
+        while (true) {
+            size_t comma = list.find(',', start);
+            std::string tok = list.substr(start, comma == std::string::npos ? std::string::npos : comma - start);
+            size_t b = tok.find_first_not_of(" \t");
+            tok = (b == std::string::npos) ? "" : tok.substr(b, tok.find_last_not_of(" \t") - b + 1);
+            std::ostringstream m;
+            m << "column index " << out.size() + 1 << " ";
+            if (tok.empty()) {
+                err = m.str() + "is empty";
+                return false;
+            }
+            if (tok[0] == '-' && tok.size() > 1 && tok.find_first_not_of("0123456789", 1) == std::string::npos) {
+                err = m.str() + "'" + tok + "' is negative";
+                return false;
+            }
+            if (tok.find_first_not_of("0123456789") != std::string::npos) {
+                err = m.str() + "'" + tok + "' is not a whole non-negative integer";
+                return false;
+            }
+            int v = 0;
+            try {
+                size_t used = 0;
+                v = std::stoi(tok, &used);
+                if (used != tok.size()) {
+                    err = m.str() + "'" + tok + "' is not a whole non-negative integer";
+                    return false;
+                }
+            } catch (const std::out_of_range &) {
+                err = m.str() + "'" + tok + "' is out of range";
+                return false;
+            } catch (const std::invalid_argument &) {
+                err = m.str() + "'" + tok + "' is not a whole non-negative integer";
+                return false;
+            }
+            if (v >= targetCols) {
+                m << "'" << tok << "' is outside the " << targetCols << " target columns";
+                err = m.str();
+                return false;
+            }
+            out.push_back(v);
+            if (comma == std::string::npos) return true;
+            start = comma + 1;
+        }
     }
 
     // True only for native integer types; a reported NUMERIC/DECIMAL scale of 0 does not
@@ -503,6 +703,36 @@ private:
         data.len = len;
         std::string rejectReason = "unrecognized syntax from remote database";
 
+        // Values read by length must fit the stored bytes; a truncated value is rejected, never shortened.
+        const char *byLength = NULL;
+        switch (vtype[i]) {
+        case CharOID:        byLength = "Char"; break;
+        case VarcharOID:     byLength = "Varchar"; break;
+        case BinaryOID:      byLength = "Binary"; break;
+        case VarbinaryOID:   byLength = "Varbinary"; break;
+#ifndef NO_LONG_OIDS
+        case LongVarcharOID:   byLength = "Long Varchar"; break;
+        case LongVarbinaryOID: byLength = "Long Varbinary"; break;
+#endif
+        case TimeOID:        byLength = "Time"; break;
+        case TimeTzOID:      byLength = "TimeTz"; break;
+        case TimestampTzOID: byLength = "TimestampTz"; break;
+        case NumericOID:     byLength = "Numeric"; break;
+        default: break;
+        }
+        if (byLength) {
+            size_t cap = (size_t)stype[i];
+            bool truncated = (data.len == SQL_NO_TOTAL) ||
+                (data.len >= 0 && (ctype[i] == SQL_C_CHAR ? (size_t)data.len >= cap : (size_t)data.len > cap));
+            if (truncated) {
+                vt_report_error(0, "Error parsing %s in column %d: value truncated by the driver (length indicator %lld, buffer %zu bytes)",
+                                byLength, vidx.at(i) + 1, (long long)data.len, cap);
+            }
+            if (data.len < 0) {
+                data.len = strnlen((char*)data.buf, cap);
+            }
+        }
+
         switch (vtype[i]) {
 
             // Simple fixed-length types
@@ -528,11 +758,6 @@ private:
 #ifndef NO_LONG_OIDS
         case LongVarcharOID: case LongVarbinaryOID:
 #endif
-            // Any negative length means the driver gave us none (SQL_NTS/SQL_NO_TOTAL);
-            // testing the sign also fixes a latent bug in the single-connection path.
-            if (data.len < 0) {
-                data.len = strnlen((char*)data.buf, getFieldSizeForCol(vidx.at(i)));
-            }
             writer->getStringRef(vidx.at(i)).copy((char*)data.buf, data.len);
             break;
 
@@ -545,8 +770,19 @@ private:
             break;
         }
         case TimeOID: {
-            SQL_TIME_STRUCT &s = *(SQL_TIME_STRUCT*)data.buf;
-            writer->setTime(vidx.at(i), getTimeFromHMS(s.hour, s.minute, s.second));
+            // Reject truncated text before reading it; SQL_NO_TOTAL means truncated, length unknown.
+            size_t cap = (size_t)stype[i];
+            size_t n = (data.len < 0) ? strnlen((char*)data.buf, cap) : (size_t)data.len;
+            if (data.len == SQL_NO_TOTAL || n >= cap) {
+                vt_report_error(0, "Error parsing Time: value truncated by the driver (length indicator %lld, buffer %zu bytes)",
+                                (long long)data.len, cap);
+            }
+            TimeADT t = 0;
+            if (!parseTimeText((const char*)data.buf, n, t)) {
+                vt_report_error(0, "Error parsing Time: '%.*s' (expected HH:MM:SS[.fraction] between 00:00:00 and 24:00:00)",
+                                (int)n, (char*)data.buf);
+            }
+            writer->setTime(vidx.at(i), t);
             break;
         }
         case TimestampOID: {
@@ -631,6 +867,9 @@ private:
     // No lock: each worker writes only its own slot, read after joinWorkers().
     void captureWorkerError(int workerIdx, SQLSMALLINT handleType, SQLHANDLE handle,
                             const char *fnName) {
+        // Failures after an abort are the expected effect of SQLCancel; they must not displace
+        // the cancellation or the worker error that caused the abort.
+        if (abortRequested(workerIdx)) return;
         SQLCHAR state_rec[6] = {0};
         SQLINTEGER native_code = 0;
         SQLCHAR message_text[MAX_DIAG_MSG_TEXT_LENGTH] = {0};
@@ -643,6 +882,30 @@ private:
         std::ostringstream m;
         m << fnName << " failed [" << (char*)message_text << "] (native " << (int)native_code << ")";
         ws.message = m.str();
+    }
+
+    // True once the load is canceled or the main thread asked this worker to abort.
+    bool abortRequested(int workerIdx) {
+        if (canceledFlag.load()) return true;
+        StmtSlot &s = *stmtSlots[workerIdx];
+        std::lock_guard<std::mutex> g(s.mtx);
+        return s.cancelRequested;
+    }
+
+    // Makes the worker's statement reachable by SQLCancel; refuses once an abort was requested.
+    bool publishStmt(int workerIdx, SQLHSTMT h) {
+        StmtSlot &s = *stmtSlots[workerIdx];
+        std::lock_guard<std::mutex> g(s.mtx);
+        if (s.cancelRequested || canceledFlag.load()) return false;
+        s.stmt = h;
+        return true;
+    }
+
+    // Must precede freeing the statement; waits for any SQLCancel already using it.
+    void unpublishStmt(int workerIdx) {
+        StmtSlot &s = *stmtSlots[workerIdx];
+        std::lock_guard<std::mutex> g(s.mtx);
+        s.stmt = SQL_NULL_HSTMT;
     }
 
     // Worker entry point: owns its own env/dbc/stmt and buffers, and shares only
@@ -659,14 +922,16 @@ private:
         struct Cleanup {
             SQLHENV *e; SQLHDBC *d; SQLHSTMT *s;
             std::vector<SQLPOINTER> *rp; std::vector<SQLLEN*> *lp;
+            ODBCLoader *self; int idx;
             ~Cleanup() {
+                self->unpublishStmt(idx);   // no SQLCancel can reach the statement after this
                 for (size_t c = 0; rp && c < rp->size(); c++) free((*rp)[c]);
                 for (size_t c = 0; lp && c < lp->size(); c++) free((*lp)[c]);
                 if (s && *s != SQL_NULL_HSTMT) { SQLFreeStmt(*s, SQL_CLOSE); SQLFreeHandle(SQL_HANDLE_STMT, *s); }
                 if (d && *d != SQL_NULL_HDBC) { SQLDisconnect(*d); SQLFreeHandle(SQL_HANDLE_DBC, *d); }
                 if (e && *e != SQL_NULL_HENV) { SQLFreeHandle(SQL_HANDLE_ENV, *e); }
             }
-        } cleanup = { &wenv, &wdbc, &wstmt, &wresp, &wlenp };
+        } cleanup = { &wenv, &wdbc, &wstmt, &wresp, &wlenp, this, workerIdx };
 
         bool done = false;
         // unixODBC serializes connections unless the driver sets Threading = 0; see README.
@@ -676,6 +941,8 @@ private:
             captureWorkerError(workerIdx, SQL_HANDLE_ENV, wenv, "SQLAllocHandle(worker env/dbc)");
             done = true;
         }
+        // SQLDriverConnect cannot be canceled, so skip it once an abort is already known.
+        if (!done && abortRequested(workerIdx)) done = true;
         if (!done && !SQL_SUCCEEDED(SQLDriverConnect(wdbc, NULL, (SQLCHAR*)connect.c_str(),
                                                      SQL_NTS, NULL, 0, NULL, SQL_DRIVER_COMPLETE))) {
             captureWorkerError(workerIdx, SQL_HANDLE_DBC, wdbc, "SQLDriverConnect(worker)");
@@ -685,10 +952,21 @@ private:
             captureWorkerError(workerIdx, SQL_HANDLE_DBC, wdbc, "SQLAllocHandle(worker stmt)");
             done = true;
         }
+        if (!done && !publishStmt(workerIdx, wstmt)) done = true;   // abort requested meanwhile
         if (!done) {
-            SQLSetStmtAttr(wstmt, SQL_ATTR_ROW_BIND_TYPE, (SQLPOINTER)SQL_BIND_BY_COLUMN, 0);
-            SQLSetStmtAttr(wstmt, SQL_ATTR_ROW_ARRAY_SIZE, (SQLPOINTER)rowset, 0);
-            SQLSetStmtAttr(wstmt, SQL_ATTR_ROWS_FETCHED_PTR, &wnfrows, 0);
+            // Never execute or fetch with rowset settings the driver rejected or changed.
+            RowsetAttrResult attrs = setRowsetAttrs(wstmt, (SQLULEN)rowset, &wnfrows);
+            workerStatus[workerIdx].warnings = attrs.warnings;
+            if (!attrs.ok && !abortRequested(workerIdx)) {
+                WorkerStatus &ws = workerStatus[workerIdx];
+                ws.failed = true;
+                ws.sqlstate = attrs.sqlstate;
+                ws.message = attrs.message;
+            }
+            if (!attrs.ok) done = true;
+        }
+        if (!done && abortRequested(workerIdx)) done = true;
+        if (!done) {
             if (!SQL_SUCCEEDED(SQLExecDirect(wstmt, (SQLCHAR*)sliceQuery.c_str(), SQL_NTS))) {
                 captureWorkerError(workerIdx, SQL_HANDLE_STMT, wstmt, "SQLExecDirect(worker)");
                 done = true;
@@ -708,7 +986,7 @@ private:
 
         SQLRETURN fetchRet = SQL_SUCCESS;
         while (!done && !workerStatus[workerIdx].failed) {
-            if (canceledFlag.load()) break;                     // US 5598915: prompt exit on cancel
+            if (abortRequested(workerIdx)) break;               // US 5598915: prompt exit on cancel/abort
             {
                 std::unique_lock<std::mutex> lk(queue.mtx);
                 if (queue.shutdown) break;
@@ -731,8 +1009,8 @@ private:
                         size_t n = (len < 0) ? (size_t)stype[i] : (size_t)len;
                         if (n > (size_t)stype[i]) n = (size_t)stype[i];
                         row[i].bytes.assign((char*)wresp[i] + (size_t)stype[i]*j, n);
-                        // Any negative indicator is normalised to SQL_NTS so the consumer re-measures.
-                        row[i].lenIndicator = (len < 0) ? SQL_NTS : len;
+                        // SQL_NO_TOTAL (truncated) is kept so emitCell() can reject it; other negatives become SQL_NTS.
+                        row[i].lenIndicator = (len == SQL_NO_TOTAL) ? SQL_NO_TOTAL : ((len < 0) ? SQL_NTS : len);
                     }
                 }
                 batch.rows.push_back(std::move(row));
@@ -749,9 +1027,13 @@ private:
         }
 
         if (!done && !SQL_SUCCEEDED(fetchRet) && fetchRet != SQL_NO_DATA &&
-            !workerStatus[workerIdx].failed && !canceledFlag.load()) {
+            !workerStatus[workerIdx].failed) {
             captureWorkerError(workerIdx, SQL_HANDLE_STMT, wstmt, "SQLFetch(worker)");
         }
+
+        // Unpublish before counting this producer out, so the main thread's cancel loop
+        // only ever sees statements whose workers are still running.
+        unpublishStmt(workerIdx);
 
         // Last producer out must wake a consumer that is waiting on an empty queue.
         {
@@ -768,6 +1050,8 @@ private:
     void startWorkers() {
         int n = std::min({(int)sliceQueries.size(), threadCountParam, MAX_THREAD});
         workerStatus.assign(n, WorkerStatus());
+        stmtSlots.clear();
+        for (int k = 0; k < n; k++) stmtSlots.push_back(std::unique_ptr<StmtSlot>(new StmtSlot()));
         queue.activeProducers = n;
         queue.shutdown = false;
         for (int k = 0; k < n; k++) {
@@ -782,7 +1066,9 @@ private:
                     workerStatus[u].message = "worker thread creation failed";
                 }
                 queue.activeProducers -= (n - k);
+                queue.shutdown = true;      // the load is doomed: abort the workers already running
                 queue.notEmpty.notify_all();
+                queue.notFull.notify_all();
                 break;
             }
         }
@@ -796,14 +1082,38 @@ private:
         queue.notEmpty.notify_all();
     }
 
-    // Joins ALL workers before returning; never detach(). Signals shutdown so a
-    // worker blocked on a full queue wakes and exits (no deadlock).
-    void joinWorkers() {
+    // Joins ALL workers before returning; never detach(). Signals shutdown so a worker blocked
+    // on a full queue wakes and exits. Only an abort cancels statements; normal completion does not.
+    void joinWorkers(bool abort) {
         requestShutdown();
+        if (abort) cancelWorkerStatements();
         for (size_t k = 0; k < workers.size(); k++) {
             if (workers[k].joinable()) workers[k].join();
         }
         workers.clear();
+    }
+
+    // SQLCancels published worker statements, repeating every CANCEL_RETRY_MS while producers remain
+    // (a cancel just before SQLExecDirect/SQLFetch starts interrupts nothing). Never limits the query.
+    void cancelWorkerStatements() {
+        std::unique_lock<std::mutex> lk(queue.mtx);
+        while (queue.activeProducers > 0) {
+            lk.unlock();    // never hold the queue lock across SQLCancel
+            for (size_t k = 0; k < stmtSlots.size(); k++) {
+                StmtSlot &s = *stmtSlots[k];
+                std::lock_guard<std::mutex> g(s.mtx);   // the worker cannot free s.stmt meanwhile
+                s.cancelRequested = true;
+                if (s.stmt == SQL_NULL_HSTMT || s.cancelFailed) continue;
+                SQLRETURN r = SQLCancel(s.stmt);
+                if (!SQL_SUCCEEDED(r)) {
+                    s.cancelFailed = true;
+                    s.cancelDiag = diagText(SQL_HANDLE_STMT, s.stmt, r, "SQLCancel()");
+                }
+            }
+            lk.lock();
+            queue.notEmpty.wait_for(lk, std::chrono::milliseconds(CANCEL_RETRY_MS),
+                                    [this]{ return queue.activeProducers <= 0; });
+        }
     }
 
     // Re-raises the lowest-indexed worker failure on the MAIN thread (US 5602339).
@@ -824,6 +1134,124 @@ private:
         return false;
     }
 
+    // Logs a cleanup warning or records a failure. Diagnostics are read immediately, but never
+    // after a successful free, because the handle no longer exists.
+    void noteCleanupResult(ServerInterface &srvInterface, SQLRETURN r, SQLSMALLINT handle_type,
+                           SQLHANDLE handle, const char *fn_name, bool frees_handle,
+                           std::vector<std::string> &errors, std::string *sqlstate = NULL) {
+        if (r == SQL_SUCCESS || (r == SQL_SUCCESS_WITH_INFO && frees_handle)) return;
+        std::string text = diagText(handle_type, handle, r, fn_name, sqlstate);
+        if (r == SQL_SUCCESS_WITH_INFO) {
+            srvInterface.log("ODBC Warning: %s", text.c_str());
+        } else {
+            errors.push_back(text);
+        }
+    }
+
+    // Frees stmt, commits (one rollback if that fails), disconnects, then frees dbc and env. Never
+    // raises, so every safe step is attempted; released handles are cleared, so a repeat is a no-op.
+    void releaseHandles(ServerInterface &srvInterface, std::vector<std::string> &errors) {
+        SQLRETURN r;
+        if (stmt != SQL_NULL_HSTMT) {
+            r = SQLFreeHandle(SQL_HANDLE_STMT, stmt);
+            noteCleanupResult(srvInterface, r, SQL_HANDLE_STMT, stmt, "SQLFreeHandle(SQL_HANDLE_STMT)", true, errors);
+            // A statement that failed to free stays owned by dbc; a successful SQLDisconnect() frees it.
+            if (SQL_SUCCEEDED(r) || r == SQL_INVALID_HANDLE) stmt = SQL_NULL_HSTMT;
+        }
+
+        if (dbc != SQL_NULL_HDBC && connected) {
+            // Fix for Issue #1. Commit before calling SQLDisconnect to avoid HY010 error.
+            std::string commit_state;
+            r = SQLEndTran(SQL_HANDLE_DBC, dbc, SQL_COMMIT);
+            noteCleanupResult(srvInterface, r, SQL_HANDLE_DBC, dbc, "SQLEndTran(SQL_COMMIT)", false, errors, &commit_state);
+            // One rollback attempt, so SQLDisconnect() is not refused for an open transaction;
+            // skipped when SQLSTATE class 08 says the connection itself is gone.
+            if (r == SQL_ERROR && commit_state.compare(0, 2, "08") != 0) {
+                SQLRETURN r_rollback = SQLEndTran(SQL_HANDLE_DBC, dbc, SQL_ROLLBACK);
+                noteCleanupResult(srvInterface, r_rollback, SQL_HANDLE_DBC, dbc,
+                                  "SQLEndTran(SQL_ROLLBACK) after the failed commit", false, errors);
+                if (SQL_SUCCEEDED(r_rollback)) {
+                    srvInterface.log("ODBC Loader: source transaction rolled back after the commit failed");
+                } else if (r_rollback == SQL_INVALID_HANDLE) {
+                    r = r_rollback;
+                }
+            }
+            if (r != SQL_INVALID_HANDLE) {
+                r = SQLDisconnect(dbc);
+                noteCleanupResult(srvInterface, r, SQL_HANDLE_DBC, dbc, "SQLDisconnect()", false, errors);
+            }
+            if (SQL_SUCCEEDED(r)) {
+                connected = false;
+                stmt = SQL_NULL_HSTMT;      // SQLDisconnect() frees any remaining statements
+            } else if (r == SQL_INVALID_HANDLE) {
+                // Nothing further can be done through an invalid handle; do not retry it.
+                dbc = SQL_NULL_HDBC;
+                stmt = SQL_NULL_HSTMT;
+                connected = false;
+            }
+        }
+
+        if (dbc != SQL_NULL_HDBC) {
+            if (connected) {
+                errors.push_back("SQLFreeHandle(SQL_HANDLE_DBC) skipped because the connection is still open");
+            } else {
+                r = SQLFreeHandle(SQL_HANDLE_DBC, dbc);
+                noteCleanupResult(srvInterface, r, SQL_HANDLE_DBC, dbc, "SQLFreeHandle(SQL_HANDLE_DBC)", true, errors);
+                if (SQL_SUCCEEDED(r) || r == SQL_INVALID_HANDLE) dbc = SQL_NULL_HDBC;
+            }
+        }
+
+        if (env != SQL_NULL_HENV) {
+            if (dbc != SQL_NULL_HDBC) {
+                errors.push_back("SQLFreeHandle(SQL_HANDLE_ENV) skipped because its connection handle is still allocated");
+            } else {
+                r = SQLFreeHandle(SQL_HANDLE_ENV, env);
+                noteCleanupResult(srvInterface, r, SQL_HANDLE_ENV, env, "SQLFreeHandle(SQL_HANDLE_ENV)", true, errors);
+                if (SQL_SUCCEEDED(r) || r == SQL_INVALID_HANDLE) env = SQL_NULL_HENV;
+            }
+        }
+    }
+
+    // The SDK does not document destroy() after setup() throws, so a failed setup() releases its
+    // handles here. Must not throw: the setup error already in flight is the one to report.
+    void releaseAfterSetupFailure(ServerInterface &srvInterface) {
+        try {
+            std::vector<std::string> errors;
+            releaseHandles(srvInterface, errors);
+            for (size_t k = 0; k < errors.size(); k++) {
+                srvInterface.log("ODBC Error during cleanup of a failed setup: %s", errors[k].c_str());
+            }
+        } catch (...) {
+            // Unreleased handles stay set, so a later destroy() can still retry them.
+        }
+    }
+
+    // Logs warnings that workers kept in their own slots. Call only after joinWorkers().
+    void reportWorkerWarnings(ServerInterface &srvInterface) {
+        for (size_t k = 0; k < workerStatus.size(); k++) {
+            for (size_t w = 0; w < workerStatus[k].warnings.size(); w++) {
+                srvInterface.log("ODBC Warning (worker %zu): %s", k, workerStatus[k].warnings[w].c_str());
+            }
+            workerStatus[k].warnings.clear();
+        }
+        for (size_t k = 0; k < stmtSlots.size(); k++) {
+            StmtSlot &s = *stmtSlots[k];
+            std::lock_guard<std::mutex> g(s.mtx);
+            if (s.cancelDiag.empty()) continue;
+            srvInterface.log("ODBC Warning (worker %zu): cancellation not delivered, so the worker ran until its call returned: %s",
+                             k, s.cancelDiag.c_str());
+            s.cancelDiag.clear();
+        }
+    }
+
+    // Vertica canceled the load: stop and join every worker, then hand control back.
+    StreamState abortForCancel(ServerInterface &srvInterface) {
+        canceledFlag.store(true);
+        joinWorkers(true);
+        reportWorkerWarnings(srvInterface);
+        return DONE;
+    }
+
 
 public:
 
@@ -831,15 +1259,12 @@ public:
         // Threaded path: the main thread is the sole consumer. Emit a bounded number
         // of batches per call so the KEEP_GOING re-entry contract still holds.
         if (threaded) {
+            // Workers cannot call isCanceled(), so publish it for them here (US 5598915).
+            if (isCanceled()) return abortForCancel(srvInterface);
+
             if (!workersStarted) {
                 startWorkers();
                 workersStarted = true;
-            }
-
-            // Workers cannot call isCanceled(), so publish it for them here.
-            if (isCanceled()) {
-                canceledFlag.store(true);
-                requestShutdown();          // wake a worker blocked on a full queue
             }
 
             uint32 batches_emitted = 0;
@@ -848,7 +1273,8 @@ public:
                 bool haveBatch = false;
                 {
                     std::unique_lock<std::mutex> lk(queue.mtx);
-                    queue.notEmpty.wait(lk, [this]{
+                    // Bounded so blocked workers cannot keep process() from yielding and seeing a cancel.
+                    queue.notEmpty.wait_for(lk, std::chrono::milliseconds(CONSUMER_WAIT_MS), [this]{
                         return !queue.items.empty() || queue.activeProducers == 0 || queue.shutdown;
                     });
                     if (!queue.items.empty()) {
@@ -874,34 +1300,40 @@ public:
                     continue;
                 }
 
-                // Nothing queued: producers are finished, or we were asked to stop.
+                // Nothing queued: producers are finished, we were asked to stop, or the wait timed out.
                 break;
             }
 
             // Cancellation check while draining (US 5598915).
-            if (isCanceled()) {
-                canceledFlag.store(true);
-                joinWorkers();
-                return DONE;
-            }
+            if (isCanceled()) return abortForCancel(srvInterface);
 
             // Not done until ALL producers finished AND the queue is fully drained.
-            bool drainedAndDone;
+            bool drainedAndDone, workerAbort;
             {
                 std::unique_lock<std::mutex> lk(queue.mtx);
                 drainedAndDone = (queue.activeProducers == 0 && queue.items.empty());
+                workerAbort = queue.shutdown;   // only a failed or unstarted worker sets this during process()
+            }
+            // The load is doomed: cancel the remaining workers instead of draining rows that roll back.
+            if (workerAbort) {
+                joinWorkers(true);
+                reportWorkerWarnings(srvInterface);
+                raiseWorkerError(srvInterface);
+                vt_report_error(0, "ODBC Loader: parallel fetch stopped without a recorded worker error");
             }
             if (!drainedAndDone) {
                 return KEEP_GOING;
             }
 
             // All workers finished and queue drained: join before returning.
-            joinWorkers();
+            joinWorkers(false);
+            reportWorkerWarnings(srvInterface);    // logged first; never replaces a worker error
             if (anyWorkerFailed()) {
                 // Rows already emitted stay uncommitted: vt_report_error aborts the
                 // COPY and Vertica rolls the transaction back.
                 raiseWorkerError(srvInterface);
             }
+            loadCompleted = true;
             return DONE;
         }
 
@@ -956,21 +1388,34 @@ public:
             return KEEP_GOING;
         }
 
+        loadCompleted = true;
         return DONE;
     }           // End PROCESS
 
     void setQuirksMode(ServerInterface &srvInterface, SQLHDBC &dbc) {
         // Set the quirks mode based on the DB name
-        SQLSMALLINT len;
-        char buf[32];
-        memset(&buf[0], 0, 32);
+        SQLSMALLINT len = -1;
+        char buf[256];
+        memset(&buf[0], 0, sizeof(buf));
 
-        SQLGetInfo(dbc, SQL_SERVER_NAME, buf,
-                   sizeof(buf) - 1 /* leave a byte for null-termination */,
-                   &len);
-        srvInterface.log("ODBC Loader: Connecting to server of type '%s'", buf);
+        SQLRETURN r = SQLGetInfo(dbc, SQL_SERVER_NAME, buf,
+                                 (SQLSMALLINT)(sizeof(buf) - 1) /* leave a byte for null-termination */,
+                                 &len);
+        handleReturnCode(srvInterface, r, SQL_HANDLE_DBC, dbc, "SQLGetInfo(SQL_SERVER_NAME)");
+        if (len < 0) {
+            vt_report_error(0, "ODBC Error: SQLGetInfo(SQL_SERVER_NAME) returned invalid length %d", (int)len);
+        }
 
-        std::string db_type(buf, len);
+        // On truncation 'len' is the full name length, not what fits in buf.
+        std::string db_type;
+        if ((size_t)len >= sizeof(buf) - 1) {
+            db_type.assign(buf, strnlen(buf, sizeof(buf) - 1));
+            srvInterface.log("ODBC Loader: server name truncated to %zu of %d bytes", db_type.size(), (int)len);
+        } else {
+            db_type.assign(buf, (size_t)len);
+        }
+        srvInterface.log("ODBC Loader: Connecting to server of type '%s'", db_type.c_str());
+
         if (db_type == "ORCL") {
             quirks = Oracle;
         }
@@ -979,7 +1424,12 @@ public:
         // MariaDB reports its own DBMS name but shares MySQL's MOD() sign semantics.
         char dbms[64];
         memset(&dbms[0], 0, sizeof(dbms));
-        SQLGetInfo(dbc, SQL_DBMS_NAME, dbms, sizeof(dbms) - 1, NULL);
+        r = SQLGetInfo(dbc, SQL_DBMS_NAME, dbms, sizeof(dbms) - 1, NULL);
+        if (!SQL_SUCCEEDED(r)) {
+            srvInterface.log("ODBC Loader: %s; DBMS unknown, modulo split disabled",
+                             diagText(SQL_HANDLE_DBC, dbc, r, "SQLGetInfo(SQL_DBMS_NAME)").c_str());
+            dbms[0] = '\0';
+        }
         std::string dbms_name(dbms);
         for (size_t i = 0; i < dbms_name.size(); i++) {
             char c = dbms_name[i];
@@ -996,6 +1446,7 @@ public:
         colInfo = returnType;
         colInTable = (int)colInfo.getColumnCount() ;
         vidx.clear() ;
+        loadCompleted = false ;         // this load's outcome, read by destroy()
 		bool src_rfilter = true ;       // Rows filtering flag
         bool src_cfilter = true ;       // Column filtering flag
         bool oq_flag = false ;          // Query Ovverride flag
@@ -1057,11 +1508,15 @@ public:
         }
         std::string split_method = "range" ;
         if (srvInterface.getParamReader().containsParameter("split_method")) {
-            split_method = srvInterface.getParamReader().getStringRef("split_method").str() ;
+            std::string supplied = srvInterface.getParamReader().getStringRef("split_method").str() ;
+            split_method = supplied ;
             for (size_t i = 0 ; i < split_method.size() ; i++) {
                 char c = split_method[i] ;
                 if (c >= 'A' && c <= 'Z') split_method[i] = c - 'A' + 'a' ;
             }
+            // Checked here so disabled threading or a split-column fallback cannot skip it.
+            if (split_method != "range" && split_method != "modulo")
+                vt_report_error(0, "Error:  Invalid split_method='%s'. Permitted values are 'range' and 'modulo'", supplied.c_str());
         }
   
         // Check "hidden" parameters __pred_#__ to filter out rows
@@ -1118,11 +1573,10 @@ public:
 srvInterface.log("-----> External Table Columns, colInTable=<%d>", colInTable);
 #endif
                    std::string slist=srvInterface.getParamReader().getStringRef("__query_col_name__").str();
-                   std::stringstream ss_idx(srvInterface.getParamReader().getStringRef("__query_col_idx__").str());
-                   std::string tk_idx ;
-                   vidx.clear();
-                   while (std::getline(ss_idx, tk_idx, ',')) {
-		   	            vidx.push_back(stoi(tk_idx));
+                   std::string idx_list = srvInterface.getParamReader().getStringRef("__query_col_idx__").str();
+                   std::string idx_err ;
+                   if (!parseColumnIndexList(idx_list, colInTable, vidx, idx_err)) {
+                       vt_report_error(0, "Error:  Invalid __query_col_idx__='%s': %s", idx_list.c_str(), idx_err.c_str());
                    }
 
                    // MF to remove Vertica casts (::<data_type>)
@@ -1157,6 +1611,12 @@ srvInterface.log("-----> External Table Columns, colInTable=<%d>", colInTable);
   srvInterface.log("DEBUG rowset=%zu", rowset);
 #endif
 
+        // Releases the handles acquired below if setup() raises; disarmed once it completes.
+        struct SetupFailureGuard {
+            ODBCLoader *self; ServerInterface *srv; bool armed;
+            ~SetupFailureGuard() { if (armed) self->releaseAfterSetupFailure(*srv); }
+        } setupGuard = { this, &srvInterface, true };
+
         // Establish an ODBC connection
         r = SQLAllocHandle(SQL_HANDLE_ENV, SQL_NULL_HANDLE, &env);
         handleReturnCode(srvInterface, r, SQL_HANDLE_ENV, env, "SQLAllocHandle()");
@@ -1169,6 +1629,7 @@ srvInterface.log("-----> External Table Columns, colInTable=<%d>", colInTable);
 
         r = SQLDriverConnect(dbc, NULL, (SQLCHAR*)connect.c_str(), SQL_NTS, NULL, 0, NULL, SQL_DRIVER_COMPLETE);
         handleReturnCode(srvInterface, r, SQL_HANDLE_DBC, dbc, "SQLDriverConnect()");
+        connected = true;
 
         // We have a connection; now we know enough to figure out
         // which DB we have to customize to
@@ -1177,17 +1638,14 @@ srvInterface.log("-----> External Table Columns, colInTable=<%d>", colInTable);
         r = SQLAllocHandle(SQL_HANDLE_STMT, dbc, &stmt);
         handleReturnCode(srvInterface, r, SQL_HANDLE_STMT, stmt, "SQLAllocHandle(SQL_HANDLE_STMT)");
 
-        // Set bind by column statement attribute:
-        r = SQLSetStmtAttr(stmt, SQL_ATTR_ROW_BIND_TYPE, (SQLPOINTER)SQL_BIND_BY_COLUMN, 0) ;
-        handleReturnCode(srvInterface, r, SQL_HANDLE_STMT, stmt, "SQLSetStmtAttr(SQL_ATTR_ROW_BIND_TYPE)");
-
-        // Set ROW_ARRAY_SIZE statement attribute:
-        r = SQLSetStmtAttr(stmt, SQL_ATTR_ROW_ARRAY_SIZE, (SQLPOINTER)rowset, 0) ;
-        handleReturnCode(srvInterface, r, SQL_HANDLE_STMT, stmt, "SQLSetStmtAttr(SQL_ATTR_ROW_ARRAY_SIZE)");
-
-        // Set ROWS_FETCHED_PTR statement attribute:
-        r = SQLSetStmtAttr(stmt, SQL_ATTR_ROWS_FETCHED_PTR, &nfrows, 0) ;
-        handleReturnCode(srvInterface, r, SQL_HANDLE_STMT, stmt, "SQLSetStmtAttr(SQL_ATTR_ROWS_FETCHED_PTR)");
+        // Column-wise binding, ROW_ARRAY_SIZE and ROWS_FETCHED_PTR; rejected or substituted values fail the load.
+        RowsetAttrResult attrs = setRowsetAttrs(stmt, (SQLULEN)rowset, &nfrows);
+        for (size_t k = 0; k < attrs.warnings.size(); k++) {
+            srvInterface.log("ODBC Warning: %s", attrs.warnings[k].c_str());
+        }
+        if (!attrs.ok) {
+            vt_report_error(0, "ODBC Error: %s", attrs.message.c_str());
+        }
 
         // Derive the split and run the first/only slice; unsplit path is unchanged.
         buildSliceQueries(srvInterface, query, (int)thread_count, split_column, split_method);
@@ -1245,25 +1703,29 @@ srvInterface.log("-----> External Table Columns, colInTable=<%d>", colInTable);
         if (threaded) {
             SQLFreeStmt(stmt, SQL_CLOSE);
         }
+        setupGuard.armed = false;
     }
 
     virtual void destroy(ServerInterface &srvInterface, SizedColumnTypes &returnType) {
         // Join before freeing handles; a joinable thread left at destruction terminates.
-        joinWorkers();
+        // Workers still running here mean process() did not finish normally, so abort them.
+        joinWorkers(true);
+        reportWorkerWarnings(srvInterface);    // any not yet reported, e.g. after process() raised
 
-        // Fix for Issue #1. Commit before calling SQLDisconnect to avoid HY010 error.
-        SQLRETURN r_end_tran = SQLEndTran(SQL_HANDLE_DBC, dbc, SQL_COMMIT);
-        handleReturnCode(srvInterface, r_end_tran, SQL_HANDLE_DBC, dbc, "SQLEndTran()");
+        std::vector<std::string> errors;
+        releaseHandles(srvInterface, errors);
+        if (errors.empty()) return;
 
-        // Try to free even on error, to minimize the risk of memory leaks.
-        // But do check for errors in the end.
-        SQLRETURN r_disconnect = SQLDisconnect(dbc);
-        SQLRETURN r_free_dbc = SQLFreeHandle(SQL_HANDLE_DBC, dbc);
-        SQLRETURN r_free_env = SQLFreeHandle(SQL_HANDLE_ENV, env);
-
-        handleReturnCode(srvInterface, r_disconnect, SQL_HANDLE_DBC, dbc, "SQLDisconnect()");
-        handleReturnCode(srvInterface, r_free_dbc, SQL_HANDLE_DBC, dbc, "SQLFreeHandle(SQL_HANDLE_DBC)");
-        handleReturnCode(srvInterface, r_free_env, SQL_HANDLE_ENV, env, "SQLFreeHandle(SQL_HANDLE_ENV)");
+        // A failed or canceled load already has its own error; log cleanup failures beside it.
+        if (!loadCompleted || isCanceled()) {
+            for (size_t k = 0; k < errors.size(); k++) {
+                srvInterface.log("ODBC Error during cleanup of a failed or canceled load: %s", errors[k].c_str());
+            }
+            return;
+        }
+        std::string all = errors[0];
+        for (size_t k = 1; k < errors.size(); k++) all += "; " + errors[k];
+        vt_report_error(0, "ODBC Error during cleanup: %s", all.c_str());
     }
 };
 

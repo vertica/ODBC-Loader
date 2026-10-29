@@ -63,8 +63,36 @@ TRUNCATE TABLE cs_wide;
 -- Test 8: a plain narrow COPY after the External Table and wide loads still maps correctly
 COPY cs_narrow WITH SOURCE ODBCSource() PARSER ODBCLoader(connect='DSN=MySQL', query='SELECT id, name FROM testdb.people;');
 SELECT id, name FROM cs_narrow ORDER BY id;
+TRUNCATE TABLE cs_narrow;
+
+-- Test 9 (VTA-119247): unknown DSN, so the connection never opens. The connect error must
+-- be the one reported; handle release itself is not observable from SQL
+COPY cs_narrow WITH SOURCE ODBCSource() PARSER ODBCLoader(connect='DSN=NoSuchDSN', query='SELECT id, name FROM testdb.people;');
+SELECT count(*) AS nrows FROM cs_narrow;
+
+-- Test 10 (VTA-119247): the remote query fails after the connection opened. The query
+-- error must be the one reported and nothing is loaded
+COPY cs_narrow WITH SOURCE ODBCSource() PARSER ODBCLoader(connect='DSN=MySQL', query='SELECT id, name FROM testdb.no_such_table;');
+SELECT count(*) AS nrows FROM cs_narrow;
+
+-- Test 11 (VTA-119247): a threaded load in the same session still succeeds after both
+-- failures, with the checked rowset attributes on the main and worker connections
+COPY cs_narrow WITH SOURCE ODBCSource() PARSER ODBCLoader(connect='DSN=MySQL', query='SELECT id, name FROM testdb.people;', thread_count=2, split_column='id', rowset=1);
+SELECT id, name FROM cs_narrow ORDER BY id;
+
+-- Test 12 (VTA-119248): External Table projections are where Vertica generates __query_col_idx__,
+-- so these reordered and non-contiguous column lists go through the strict index parser
+CREATE EXTERNAL TABLE public.cs_ewide (i integer, v varchar(32), f float, c char(32), lv varchar(9999), d date, n numeric(18,4))
+    AS COPY WITH SOURCE ODBCSource() PARSER ODBCLoader(connect='DSN=MySQL', query='SELECT i, v, f, c, lv, d, n FROM testdb.test_source');
+SELECT max(n) AS max_n, max(d) AS max_d, sum(i) AS sum_i FROM public.cs_ewide;
+SELECT count(*) AS nrows, count(lv) AS nn_lv, sum(f) AS sum_f FROM public.cs_ewide;
+
+-- Test 13 (VTA-119248): a direct wide COPY after the validated projections still uses the full mapping
+COPY cs_wide WITH SOURCE ODBCSource() PARSER ODBCLoader(connect='DSN=MySQL', query='SELECT i, v, f, c, lv, d, n FROM testdb.test_source;');
+SELECT count(*) AS nrows, count(i) AS nn_i, sum(i) AS sum_i, sum(length(v)) AS len_v, count(n) AS nn_n FROM cs_wide;
 
 -- Clean up
+DROP TABLE public.cs_ewide;
 DROP TABLE public.cs_epeople;
 DROP TABLE cs_narrow;
 DROP TABLE cs_wide;

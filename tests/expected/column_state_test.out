@@ -98,6 +98,53 @@ TRUNCATE TABLE
  103 | Charlie
 (3 rows)
 
+TRUNCATE TABLE
+vsql: ERROR: ODBC Error: SQLDriverConnect() failed with error code IM002, native code 0 [[unixODBC][Driver Manager]Data source name not found and no default driver specified]
+ nrows 
+-------
+     0
+(1 row)
+
+vsql: ERROR: ODBC Error: SQLExecDirect() failed with error code 42S02, native code 1146 [[MySQL][...][...]Table 'testdb.no_such_table' doesn't exist]
+ nrows 
+-------
+     0
+(1 row)
+
+ Rows Loaded 
+-------------
+           3
+(1 row)
+
+ id  |  name   
+-----+---------
+ 101 | Alice
+ 102 | Bob
+ 103 | Charlie
+(3 rows)
+
+CREATE TABLE
+    max_n    |   max_d    | sum_i 
+-------------+------------+-------
+ 123456.7890 | 2000-01-09 |    45
+(1 row)
+
+ nrows | nn_lv | sum_f 
+-------+-------+-------
+    10 |     9 |  49.5
+(1 row)
+
+ Rows Loaded 
+-------------
+          10
+(1 row)
+
+ nrows | nn_i | sum_i | len_v | nn_n 
+-------+------+-------+-------+------
+    10 |    9 |    45 |    54 |    9
+(1 row)
+
+DROP TABLE
 DROP TABLE
 DROP TABLE
 DROP TABLE

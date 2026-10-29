@@ -58,8 +58,17 @@ COPY mt_target WITH SOURCE ODBCSource() PARSER ODBCLoader(connect='DSN=MySQL', q
 SELECT count(*) AS nrows, count(i) AS nn_i, sum(i) AS sum_i, sum(length(v)) AS len_v FROM mt_target;
 TRUNCATE TABLE mt_target;
 
--- Test 10: an unrecognized split_method uses the portable range split
+-- Test 10 (VTA-119248): a split_method other than range/modulo is rejected in setup() and
+-- loads nothing, also with threading disabled, no split column or a falling-back split column
 COPY mt_target WITH SOURCE ODBCSource() PARSER ODBCLoader(connect='DSN=MySQL', query='SELECT i, v FROM testdb.test_source;', thread_count=4, split_column='i', split_method='bogus');
+COPY mt_target WITH SOURCE ODBCSource() PARSER ODBCLoader(connect='DSN=MySQL', query='SELECT i, v FROM testdb.test_source;', thread_count=1, split_column='i', split_method='bogus');
+COPY mt_target WITH SOURCE ODBCSource() PARSER ODBCLoader(connect='DSN=MySQL', query='SELECT i, v FROM testdb.test_source;', split_method='Bogus');
+COPY mt_target WITH SOURCE ODBCSource() PARSER ODBCLoader(connect='DSN=MySQL', query='SELECT i, v FROM testdb.test_source;', thread_count=4, split_column='no_such_column', split_method='bogus');
+COPY mt_target WITH SOURCE ODBCSource() PARSER ODBCLoader(connect='DSN=MySQL', query='SELECT i, v FROM testdb.test_source;', thread_count=4, split_column='i', split_method='');
+SELECT count(*) AS nrows FROM mt_target;
+
+-- Same session afterwards: mixed-case 'Range' is normalized and the split load completes
+COPY mt_target WITH SOURCE ODBCSource() PARSER ODBCLoader(connect='DSN=MySQL', query='SELECT i, v FROM testdb.test_source;', thread_count=4, split_column='i', split_method='Range');
 SELECT count(*) AS nrows, count(i) AS nn_i, sum(i) AS sum_i, sum(length(v)) AS len_v FROM mt_target;
 TRUNCATE TABLE mt_target;
 
@@ -112,6 +121,13 @@ SELECT id, name FROM public.mt_people ORDER BY id;
 -- captureWorkerError -> re-raise on the main thread -> Vertica rolls the COPY
 -- back, so none of the rows the healthy workers already emitted are committed.
 COPY mt_target WITH SOURCE ODBCSource() PARSER ODBCLoader(connect='DSN=MySQL', query='SELECT i, ST_ASTEXT(ST_GEOMFROMTEXT(CASE WHEN i > 6 THEN ''oops'' ELSE ''POINT(1 1)'' END)) AS v FROM testdb.test_source;', thread_count=3, split_column='i');
+SELECT count(*) AS nrows FROM mt_target;
+
+-- Test 16b (VTA-119250): the same failure while another worker is still executing. Row 5
+-- holds slice 1 in a bounded SLEEP(5) when slice 2 fails, so the abort sends SQLCancel to a
+-- running statement. The original GIS error must still be reported, not the canceled worker's
+-- "interrupted" error, and nothing is loaded. Timing is not asserted here.
+COPY mt_target WITH SOURCE ODBCSource() PARSER ODBCLoader(connect='DSN=MySQL', query='SELECT i, ST_ASTEXT(ST_GEOMFROMTEXT(CASE WHEN i > 6 THEN ''oops'' WHEN i = 5 AND SLEEP(5) = 0 THEN ''POINT(5 5)'' ELSE ''POINT(1 1)'' END)) AS v FROM testdb.test_source;', thread_count=3, split_column='i');
 SELECT count(*) AS nrows FROM mt_target;
 
 -- Tests 17-28 are the regression guard for VTA-118933. Each fixture is built inline
@@ -225,9 +241,81 @@ SELECT id, payload FROM mt_numeric ORDER BY payload;
 SELECT count(*) AS nrows FROM mt_numeric;
 TRUNCATE TABLE mt_numeric;
 
+-- Tests 33-35 (VTA-119249): TIME fractional seconds. The fixture is built inline as MySQL
+-- TIME(6), because testdb.test_source.t has no fractional precision. Keys are native integers.
+CREATE TABLE mt_time (id integer, t time(6));
+
+-- Test 33: single connection; rowset=4 fetches a full batch of 4 then a partial batch of 2
+COPY mt_time WITH SOURCE ODBCSource() PARSER ODBCLoader(connect='DSN=MySQL', query='SELECT CAST(1 AS SIGNED) AS id, CAST(''00:00:00'' AS TIME(6)) AS t UNION ALL SELECT CAST(2 AS SIGNED), CAST(''12:34:56'' AS TIME(6)) UNION ALL SELECT CAST(3 AS SIGNED), CAST(''12:34:56.123456'' AS TIME(6)) UNION ALL SELECT CAST(4 AS SIGNED), CAST(''23:59:59.999999'' AS TIME(6)) UNION ALL SELECT CAST(5 AS SIGNED), CAST(NULL AS TIME(6)) UNION ALL SELECT CAST(6 AS SIGNED), CAST(''00:00:00.000001'' AS TIME(6));', rowset=4);
+SELECT id, t, t IS NULL AS t_null FROM mt_time ORDER BY id;
+TRUNCATE TABLE mt_time;
+
+-- Test 34: range split of keys 1-6 over 2 workers; with rowset=2 each slice fetches 2 then a partial 1
+COPY mt_time WITH SOURCE ODBCSource() PARSER ODBCLoader(connect='DSN=MySQL', query='SELECT CAST(1 AS SIGNED) AS id, CAST(''00:00:00'' AS TIME(6)) AS t UNION ALL SELECT CAST(2 AS SIGNED), CAST(''12:34:56'' AS TIME(6)) UNION ALL SELECT CAST(3 AS SIGNED), CAST(''12:34:56.123456'' AS TIME(6)) UNION ALL SELECT CAST(4 AS SIGNED), CAST(''23:59:59.999999'' AS TIME(6)) UNION ALL SELECT CAST(5 AS SIGNED), CAST(NULL AS TIME(6)) UNION ALL SELECT CAST(6 AS SIGNED), CAST(''00:00:00.000001'' AS TIME(6));', thread_count=2, split_column='id', split_method='range', rowset=2);
+SELECT id, t, t IS NULL AS t_null FROM mt_time ORDER BY id;
+TRUNCATE TABLE mt_time;
+
+-- Test 35: External Table projecting only t, so fetched column 0 maps to target column 1
+CREATE EXTERNAL TABLE public.mt_etime (id integer, t time(6)) AS COPY WITH SOURCE ODBCSource() PARSER ODBCLoader(connect='DSN=MySQL', query='SELECT CAST(1 AS SIGNED) AS id, CAST(''00:00:00'' AS TIME(6)) AS t UNION ALL SELECT CAST(2 AS SIGNED), CAST(''12:34:56'' AS TIME(6)) UNION ALL SELECT CAST(3 AS SIGNED), CAST(''12:34:56.123456'' AS TIME(6)) UNION ALL SELECT CAST(4 AS SIGNED), CAST(''23:59:59.999999'' AS TIME(6)) UNION ALL SELECT CAST(5 AS SIGNED), CAST(NULL AS TIME(6)) UNION ALL SELECT CAST(6 AS SIGNED), CAST(''00:00:00.000001'' AS TIME(6));');
+SELECT t, t IS NULL AS t_null FROM public.mt_etime ORDER BY t_null, t;
+
+-- Test 36 (VTA-119249): parser rounding and the 24:00:00 boundary. The source returns text, not
+-- TIME(6), so MySQL cannot round these values before they reach the loader's TIME parser.
+COPY mt_time WITH SOURCE ODBCSource() PARSER ODBCLoader(connect='DSN=MySQL', query='SELECT CAST(1 AS SIGNED) AS id, ''12:34:56.1234564'' AS t UNION ALL SELECT CAST(2 AS SIGNED), ''12:34:56.1234565'' UNION ALL SELECT CAST(3 AS SIGNED), ''23:59:59.9999995'' UNION ALL SELECT CAST(4 AS SIGNED), ''24:00:00'' UNION ALL SELECT CAST(5 AS SIGNED), ''24:00:00.0000000'';');
+SELECT id, t FROM mt_time ORDER BY id;
+TRUNCATE TABLE mt_time;
+
+-- 24:00:00.0000001 would round to 24:00:00 but lies past it, so the load is rejected and rolled back
+COPY mt_time WITH SOURCE ODBCSource() PARSER ODBCLoader(connect='DSN=MySQL', query='SELECT CAST(1 AS SIGNED) AS id, ''12:34:56'' AS t UNION ALL SELECT CAST(2 AS SIGNED), ''24:00:00.0000001'';');
+SELECT count(*) AS nrows FROM mt_time;
+
+-- Same session afterwards: a valid text TIME loads normally
+COPY mt_time WITH SOURCE ODBCSource() PARSER ODBCLoader(connect='DSN=MySQL', query='SELECT CAST(1 AS SIGNED) AS id, ''12:34:56'' AS t;');
+SELECT id, t FROM mt_time ORDER BY id;
+
+-- Tests 37-40 (PR #27 follow-up): each row carries the MySQL CONNECTION_ID() that produced it,
+-- so the split decision is observed from the connections actually used, not inferred from row counts.
+CREATE TABLE mt_conn (id NUMERIC(10,0), payload INT, conn_id INT);
+
+-- Test 37: whole-valued DECIMAL keys, thread_count=4, default split; must fall back to one connection
+COPY mt_conn WITH SOURCE ODBCSource() PARSER ODBCLoader(connect='DSN=MySQL', query='SELECT CAST(1 AS DECIMAL(10,0)) AS id, 1 AS payload, CAST(CONNECTION_ID() AS SIGNED) AS conn_id UNION ALL SELECT CAST(2 AS DECIMAL(10,0)), 2, CAST(CONNECTION_ID() AS SIGNED) UNION ALL SELECT CAST(3 AS DECIMAL(10,0)), 3, CAST(CONNECTION_ID() AS SIGNED) UNION ALL SELECT CAST(4 AS DECIMAL(10,0)), 4, CAST(CONNECTION_ID() AS SIGNED) UNION ALL SELECT CAST(5 AS DECIMAL(10,0)), 5, CAST(CONNECTION_ID() AS SIGNED) UNION ALL SELECT CAST(NULL AS DECIMAL(10,0)), 6, CAST(CONNECTION_ID() AS SIGNED);', thread_count=4, split_column='id');
+SELECT id, payload FROM mt_conn ORDER BY payload;
+SELECT count(*) AS nrows, count(conn_id) AS nn_conn, count(DISTINCT conn_id) = 1 AS one_conn FROM mt_conn;
+TRUNCATE TABLE mt_conn;
+
+-- Test 38: whole-valued DECIMAL keys, explicit range split; must fall back to one connection
+COPY mt_conn WITH SOURCE ODBCSource() PARSER ODBCLoader(connect='DSN=MySQL', query='SELECT CAST(1 AS DECIMAL(10,0)) AS id, 1 AS payload, CAST(CONNECTION_ID() AS SIGNED) AS conn_id UNION ALL SELECT CAST(2 AS DECIMAL(10,0)), 2, CAST(CONNECTION_ID() AS SIGNED) UNION ALL SELECT CAST(3 AS DECIMAL(10,0)), 3, CAST(CONNECTION_ID() AS SIGNED) UNION ALL SELECT CAST(4 AS DECIMAL(10,0)), 4, CAST(CONNECTION_ID() AS SIGNED) UNION ALL SELECT CAST(5 AS DECIMAL(10,0)), 5, CAST(CONNECTION_ID() AS SIGNED) UNION ALL SELECT CAST(NULL AS DECIMAL(10,0)), 6, CAST(CONNECTION_ID() AS SIGNED);', thread_count=4, split_column='id', split_method='range');
+SELECT id, payload FROM mt_conn ORDER BY payload;
+SELECT count(*) AS nrows, count(conn_id) AS nn_conn, count(DISTINCT conn_id) = 1 AS one_conn FROM mt_conn;
+TRUNCATE TABLE mt_conn;
+
+-- Test 39: whole-valued DECIMAL keys, modulo split; must fall back to one connection
+COPY mt_conn WITH SOURCE ODBCSource() PARSER ODBCLoader(connect='DSN=MySQL', query='SELECT CAST(1 AS DECIMAL(10,0)) AS id, 1 AS payload, CAST(CONNECTION_ID() AS SIGNED) AS conn_id UNION ALL SELECT CAST(2 AS DECIMAL(10,0)), 2, CAST(CONNECTION_ID() AS SIGNED) UNION ALL SELECT CAST(3 AS DECIMAL(10,0)), 3, CAST(CONNECTION_ID() AS SIGNED) UNION ALL SELECT CAST(4 AS DECIMAL(10,0)), 4, CAST(CONNECTION_ID() AS SIGNED) UNION ALL SELECT CAST(5 AS DECIMAL(10,0)), 5, CAST(CONNECTION_ID() AS SIGNED) UNION ALL SELECT CAST(NULL AS DECIMAL(10,0)), 6, CAST(CONNECTION_ID() AS SIGNED);', thread_count=4, split_column='id', split_method='modulo');
+SELECT id, payload FROM mt_conn ORDER BY payload;
+SELECT count(*) AS nrows, count(conn_id) AS nn_conn, count(DISTINCT conn_id) = 1 AS one_conn FROM mt_conn;
+TRUNCATE TABLE mt_conn;
+
+-- Test 40: positive control; native integer keys 1-6 over 3 range slices must use several connections
+COPY mt_conn WITH SOURCE ODBCSource() PARSER ODBCLoader(connect='DSN=MySQL', query='SELECT CAST(1 AS SIGNED) AS id, 1 AS payload, CAST(CONNECTION_ID() AS SIGNED) AS conn_id UNION ALL SELECT CAST(2 AS SIGNED), 2, CAST(CONNECTION_ID() AS SIGNED) UNION ALL SELECT CAST(3 AS SIGNED), 3, CAST(CONNECTION_ID() AS SIGNED) UNION ALL SELECT CAST(4 AS SIGNED), 4, CAST(CONNECTION_ID() AS SIGNED) UNION ALL SELECT CAST(5 AS SIGNED), 5, CAST(CONNECTION_ID() AS SIGNED) UNION ALL SELECT CAST(6 AS SIGNED), 6, CAST(CONNECTION_ID() AS SIGNED) UNION ALL SELECT CAST(NULL AS SIGNED), 7, CAST(CONNECTION_ID() AS SIGNED);', thread_count=3, split_column='id');
+SELECT id, payload FROM mt_conn ORDER BY payload;
+SELECT count(*) AS nrows, count(conn_id) AS nn_conn, count(DISTINCT conn_id) > 1 AS multi_conn FROM mt_conn;
+
+-- Test 41: a 200-character numeric string overflows the 128-byte NUMERIC fetch buffer; it must be
+-- rejected as truncated, not parsed from a shortened value, on both loading paths
+COPY mt_numeric WITH SOURCE ODBCSource() PARSER ODBCLoader(connect='DSN=MySQL', query='SELECT REPEAT(''9'', 200) AS id, CAST(1 AS SIGNED) AS payload UNION ALL SELECT ''2'', CAST(2 AS SIGNED) UNION ALL SELECT ''3'', CAST(3 AS SIGNED) UNION ALL SELECT ''4'', CAST(4 AS SIGNED);');
+COPY mt_numeric WITH SOURCE ODBCSource() PARSER ODBCLoader(connect='DSN=MySQL', query='SELECT REPEAT(''9'', 200) AS id, CAST(1 AS SIGNED) AS payload UNION ALL SELECT ''2'', CAST(2 AS SIGNED) UNION ALL SELECT ''3'', CAST(3 AS SIGNED) UNION ALL SELECT ''4'', CAST(4 AS SIGNED);', thread_count=2, split_column='payload');
+SELECT count(*) AS nrows FROM mt_numeric;
+
+-- Test 42: the same shape with values that fit still loads in the same session
+COPY mt_numeric WITH SOURCE ODBCSource() PARSER ODBCLoader(connect='DSN=MySQL', query='SELECT ''1'' AS id, CAST(1 AS SIGNED) AS payload UNION ALL SELECT ''2'', CAST(2 AS SIGNED) UNION ALL SELECT ''3'', CAST(3 AS SIGNED) UNION ALL SELECT ''4'', CAST(4 AS SIGNED);', thread_count=2, split_column='payload');
+SELECT id, payload FROM mt_numeric ORDER BY payload;
+
 -- Clean up
+DROP TABLE public.mt_etime;
 DROP TABLE public.mt_people;
 DROP TABLE mt_target;
 DROP TABLE mt_bigint;
 DROP TABLE mt_numeric;
 DROP TABLE mt_fraction;
+DROP TABLE mt_time;
+DROP TABLE mt_conn;
